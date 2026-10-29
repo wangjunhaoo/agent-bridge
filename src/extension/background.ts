@@ -27,6 +27,8 @@ let nativePort: chrome.runtime.Port | null = null;
 let nativeConnected = false;
 let lastNativeError: string | null = null;
 let guardConfig: ExtensionGuardConfig = { ...DEFAULT_GUARD_CONFIG };
+let lastControlledTabId: number | null = null;
+const injectedTabsInSession = new Set<number>();
 const tabTelemetry = new Map<number, TabTelemetryState>();
 const auditLogs: AuditLogItem[] = [];
 
@@ -272,6 +274,16 @@ chrome.debugger.onDetach.addListener((source) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabTelemetry.delete(tabId);
+  injectedTabsInSession.delete(tabId);
+  if (lastControlledTabId === tabId) {
+    lastControlledTabId = null;
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") {
+    injectedTabsInSession.delete(tabId);
+  }
 });
 
 async function sendCdp<T = any>(tabId: number, method: string, commandParams: Record<string, unknown> = {}): Promise<T> {
@@ -320,11 +332,26 @@ async function ensureDebuggerAttached(tabId: number, enableTelemetryDomains = tr
 }
 
 async function resolveTargetTab(tabId?: number): Promise<chrome.tabs.Tab> {
-  if (typeof tabId === "number") {
-    const tab = await chrome.tabs.get(tabId);
-    if (!tab) throw new Error(`Tab ${tabId} not found`);
+  if (tabId !== undefined && tabId !== null && !Number.isNaN(Number(tabId))) {
+    const numericId = Number(tabId);
+    const tab = await chrome.tabs.get(numericId);
+    if (!tab) throw new Error(`Tab ${numericId} not found`);
+    lastControlledTabId = numericId;
     return tab;
   }
+
+  // 若调用方未传 tabId，优先复用最近一次由 Agent 打开或拍过快照的受控 Tab（避免误操作用户正在前台看的飞书等页面）
+  if (lastControlledTabId !== null) {
+    try {
+      const remembered = await chrome.tabs.get(lastControlledTabId);
+      if (remembered && remembered.id !== undefined) {
+        return remembered;
+      }
+    } catch {
+      lastControlledTabId = null;
+    }
+  }
+
   const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (activeTab?.id !== undefined) return activeTab;
 
@@ -349,6 +376,19 @@ async function assertTabAllowed(tab: chrome.tabs.Tab): Promise<number> {
  * 向目标 Tab 的 Content Script 发送消息；若该 Tab 是在插件安装前打开的，自动动态注入 content.js 再重试。
  */
 async function sendContentMessage<T = any>(tabId: number, type: string, payload?: unknown): Promise<T> {
+  // 每次扩展重载后的新会话首次触达存量 Tab 时，主动注入最新构建的 content.js，确保无需刷新网页即刻生效
+  if (!injectedTabsInSession.has(tabId)) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["content.js"]
+      });
+      injectedTabsInSession.add(tabId);
+    } catch {
+      // 某些受限页面无法注入时交由后续 trySend 报错
+    }
+  }
+
   const trySend = () =>
     new Promise<T>((resolve, reject) => {
       chrome.tabs.sendMessage(tabId, { type, payload }, (response) => {
@@ -382,6 +422,7 @@ async function sendContentMessage<T = any>(tabId: number, type: string, payload?
         target: { tabId },
         files: ["content.js"]
       });
+      injectedTabsInSession.add(tabId);
       return await trySend();
     }
     throw err;
@@ -542,12 +583,14 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           };
         }
 
-        const active = Boolean(params.active ?? true);
+        // 默认 active: false（后台静默打开不抢占用户焦点，除非调用方显式传 active: true）
+        const active = Boolean(params.active ?? false);
         const useTabGroup = params.inAgentGroup !== false;
         const created = await chrome.tabs.create({ url, active });
         if (created.id === undefined) {
           throw new Error("Failed to create tab");
         }
+        lastControlledTabId = created.id;
 
         let groupId = created.groupId;
         if (useTabGroup) {

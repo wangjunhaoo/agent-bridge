@@ -1,7 +1,19 @@
 import type { InteractiveElementNode, PageSnapshotResult } from "../shared/protocol.js";
 
 const REF_ATTR = "data-agent-ref";
+const REF_ATTR_ALIAS = "data-agent-bridge-ref";
 const STAGE_HOST_ID = "__agent_bridge_stage_host__";
+
+/**
+ * 内存级快照元素索引：
+ * 解决 (1) Shadow DOM 节点 querySelector 无法穿透、(2) React/Vue 动态重渲染导致 DOM 节点替换后报 Element not found
+ */
+const snapshotElementMap = new Map<string, HTMLElement>();
+const snapshotMetaMap = new Map<string, InteractiveElementNode>();
+
+function isPageHidden(): boolean {
+  return document.hidden || document.visibilityState !== "visible";
+}
 
 const SENSITIVE_SUBMIT_PATTERN =
   /\b(submit|send|pay|purchase|checkout|delete|remove|confirm|publish|transfer|authorize|提交|发送|支付|付款|结算|删除|移除|确认|发布|转账|授权)\b/i;
@@ -463,15 +475,16 @@ async function animateCursorTo(
   const dy = targetY - startY;
   const distance = Math.hypot(dx, dy);
 
-  if (distance < 4) {
+  // 后台标签页 (document.hidden) 下 Chrome 会挂起 requestAnimationFrame，直接 0ms 瞬移返回，杜绝后台操控超时
+  if (isPageHidden() || distance < 4) {
     st.cursorX = targetX;
     st.cursorY = targetY;
     st.cursorWrapEl.style.transform = `translate3d(${targetX}px, ${targetY}px, 0)`;
     return;
   }
 
-  // 根据距离自适应动画时长 (420ms ~ 820ms)，让肉眼清晰看到拟人加减速弧线滑行
-  const durationMs = Math.min(820, Math.max(420, Math.round(distance * 0.95)));
+  // 根据距离自适应动画时长 (380ms ~ 720ms)，让前台肉眼清晰看到拟人加减速弧线滑行
+  const durationMs = Math.min(720, Math.max(380, Math.round(distance * 0.85)));
   const midX = (startX + targetX) / 2;
   const midY = (startY + targetY) / 2;
   const bend = Math.min(85, distance * 0.18);
@@ -483,8 +496,27 @@ async function animateCursorTo(
   return new Promise<void>((resolve) => {
     const startTime = performance.now();
     let lastTrailTime = 0;
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(safetyTimer);
+      st.cursorX = targetX;
+      st.cursorY = targetY;
+      st.cursorWrapEl.style.transform = `translate3d(${targetX}px, ${targetY}px, 0)`;
+      resolve();
+    };
+
+    // 硬超时守卫：若动画中途用户切走标签页导致 rAF 被 Chrome 挂起，按时强制完成，绝不阻塞 RPC
+    const safetyTimer = setTimeout(finish, durationMs + 80);
 
     const step = (now: number) => {
+      if (settled) return;
+      if (isPageHidden()) {
+        finish();
+        return;
+      }
       const elapsed = now - startTime;
       const rawT = Math.min(1, elapsed / durationMs);
       // easeOutCubic + easeInOut 混合平滑曲线
@@ -506,10 +538,7 @@ async function animateCursorTo(
       if (rawT < 1) {
         requestAnimationFrame(step);
       } else {
-        st.cursorX = targetX;
-        st.cursorY = targetY;
-        st.cursorWrapEl.style.transform = `translate3d(${targetX}px, ${targetY}px, 0)`;
-        resolve();
+        finish();
       }
     };
 
@@ -764,7 +793,14 @@ export function collectInteractiveSnapshot(options?: {
   ensureAgentStage();
   setStageActionLabel("扫描页面元素", `AgentBridge 正在感知页面结构 (${document.title || location.hostname})`);
 
-  document.querySelectorAll(`[${REF_ATTR}]`).forEach((el) => el.removeAttribute(REF_ATTR));
+  snapshotElementMap.clear();
+  snapshotMetaMap.clear();
+  document
+    .querySelectorAll(`[${REF_ATTR}], [${REF_ATTR_ALIAS}]`)
+    .forEach((el) => {
+      el.removeAttribute(REF_ATTR);
+      el.removeAttribute(REF_ATTR_ALIAS);
+    });
 
   const elements: InteractiveElementNode[] = [];
   let counter = 0;
@@ -799,7 +835,10 @@ export function collectInteractiveSnapshot(options?: {
 
       counter += 1;
       const ref = `e${counter}`;
+      // 无论 highlight 是 true 还是 false，始终写入双属性并注册到内存 Map
       el.setAttribute(REF_ATTR, ref);
+      el.setAttribute(REF_ATTR_ALIAS, ref);
+      snapshotElementMap.set(ref, el);
 
       const role = inferRole(el);
       const name = computeAccessibleName(el);
@@ -839,6 +878,7 @@ export function collectInteractiveSnapshot(options?: {
         node.href = el.href;
       }
 
+      snapshotMetaMap.set(ref, node);
       elements.push(node);
     }
   };
@@ -869,20 +909,83 @@ export function collectInteractiveSnapshot(options?: {
   };
 }
 
+function queryDeepSelector(selector: string, root: Document | ShadowRoot | Element = document): HTMLElement | null {
+  const direct = root.querySelector(selector) as HTMLElement | null;
+  if (direct) return direct;
+  const all = root.querySelectorAll("*");
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i] as HTMLElement;
+    if (el.id === STAGE_HOST_ID) continue;
+    if (el.shadowRoot) {
+      const found = queryDeepSelector(selector, el.shadowRoot);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function findElementByRefOrSelector(ref?: string, selector?: string): HTMLElement {
   if (ref) {
-    const byRef = document.querySelector(`[${REF_ATTR}="${CSS.escape(ref)}"]`) as HTMLElement | null;
-    if (byRef) return byRef;
+    // 1. 内存 Map O(1) 直连命中
+    const cached = snapshotElementMap.get(ref);
+    if (cached && cached.isConnected) {
+      return cached;
+    }
+
+    // 2. 穿透 ShadowRoot 检索 data-agent-ref / data-agent-bridge-ref 属性
+    const escaped = CSS.escape(ref);
+    const byAttr = queryDeepSelector(`[${REF_ATTR}="${escaped}"], [${REF_ATTR_ALIAS}="${escaped}"]`);
+    if (byAttr) {
+      snapshotElementMap.set(ref, byAttr);
+      return byAttr;
+    }
+
+    // 3. 若 SPA (React/Vue) 在 snapshot 后重渲染替换了 DOM 节点，使用快照元数据自愈匹配
+    const meta = snapshotMetaMap.get(ref);
+    if (meta) {
+      const candidates = Array.from(document.querySelectorAll(meta.tagName)) as HTMLElement[];
+      let bestMatch: HTMLElement | null = null;
+      let bestScore = -1;
+
+      for (const cand of candidates) {
+        const style = window.getComputedStyle(cand);
+        const rect = cand.getBoundingClientRect();
+        if (!isElementVisible(cand, style, rect)) continue;
+
+        const candName = computeAccessibleName(cand);
+        const candText = (cand.innerText || cand.textContent || "").replace(/\s+/g, " ").trim().slice(0, 100);
+        let score = 0;
+        if (meta.name && (candName === meta.name || candText === meta.name)) score += 100;
+        else if (meta.text && candText === meta.text) score += 80;
+        else if (meta.name && (candName.includes(meta.name) || meta.name.includes(candName))) score += 40;
+
+        const dist = Math.hypot(rect.left - meta.rect.x, rect.top - meta.rect.y);
+        if (dist < 80) score += Math.max(0, 50 - dist * 0.5);
+
+        if (score > bestScore && score >= 45) {
+          bestScore = score;
+          bestMatch = cand;
+        }
+      }
+
+      if (bestMatch) {
+        bestMatch.setAttribute(REF_ATTR, ref);
+        bestMatch.setAttribute(REF_ATTR_ALIAS, ref);
+        snapshotElementMap.set(ref, bestMatch);
+        return bestMatch;
+      }
+    }
   }
+
   if (selector) {
-    const bySelector = document.querySelector(selector) as HTMLElement | null;
+    const bySelector = queryDeepSelector(selector);
     if (bySelector) return bySelector;
   }
   throw new Error(`Element not found for ${ref ? `ref="${ref}"` : `selector="${selector}"`}. Run dom.snapshot first.`);
 }
 
 /**
- * 准备并动画滑行虚拟鼠标至目标元素（在点击或输入前调用）
+ * 准备并动画滑行虚拟鼠标至目标元素（后台 Tab 自动 0ms 瞬发，不等待动画或平滑滚动）
  */
 async function prepareAndGlideToElement(params: {
   ref?: string;
@@ -891,8 +994,14 @@ async function prepareAndGlideToElement(params: {
   skipClickRipple?: boolean;
 }) {
   const el = findElementByRefOrSelector(params.ref, params.selector);
-  el.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
-  await new Promise((r) => setTimeout(r, 120));
+  const hidden = isPageHidden();
+
+  if (hidden) {
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
+  } else {
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+    await new Promise((r) => setTimeout(r, 90));
+  }
 
   const rect = el.getBoundingClientRect();
   const role = inferRole(el);
@@ -914,7 +1023,7 @@ async function prepareAndGlideToElement(params: {
 
   await animateCursorTo(x, y, actionVerb, `AgentBridge 正在${actionVerb}`);
 
-  if (!params.skipClickRipple && params.actionType !== "hover") {
+  if (!hidden && !params.skipClickRipple && params.actionType !== "hover") {
     spawnClickRipple(x, y);
   }
 
@@ -1172,8 +1281,12 @@ const messageListener = (
           const dx = Number(message.payload?.deltaX ?? 0);
           const dy = Number(message.payload?.deltaY ?? 500);
           setStageActionLabel(dy >= 0 ? "向下滚动" : "向上滚动", "AgentBridge 正在滚动浏览页面");
-          window.scrollBy({ left: dx, top: dy, behavior: "smooth" });
-          await new Promise((r) => setTimeout(r, 260));
+          if (isPageHidden()) {
+            window.scrollBy({ left: dx, top: dy, behavior: "instant" as ScrollBehavior });
+          } else {
+            window.scrollBy({ left: dx, top: dy, behavior: "smooth" });
+            await new Promise((r) => setTimeout(r, 180));
+          }
           sendResponse({
             ok: true,
             result: {

@@ -30,7 +30,7 @@ export const MCP_TOOLS: McpToolDefinition[] = [
         url: { type: "string", description: "Target URL to open" },
         active: {
           type: "boolean",
-          description: "Whether to focus the new tab in foreground (default: true)"
+          description: "Whether to focus the new tab in foreground (default: false for non-intrusive background execution)"
         },
         inAgentGroup: {
           type: "boolean",
