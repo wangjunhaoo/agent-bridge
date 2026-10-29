@@ -1,0 +1,23 @@
+{
+  "name": "agent-bridge",
+  "version": "1.0.0",
+  "description": "Control your browser with AI Agents — Native Messaging + CDP + Tab Group Chrome Extension, MCP Server & CLI",
+  "type": "module",
+  "bin": {
+    "agent-bridge": "./dist/host/cli.js"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "install-host": "node ./dist/host/cli.js install"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

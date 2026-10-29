@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "AgentBridge",
+  "version": "1.0.0",
+  "description": "Control your browser with AI Agents.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6oUPFXGq6Z7Mwiego9EmCTeBxoX9PKgnxYuc2In735xEU06LCv+PzSGtL7ikQ4RiUWL05aZUyzFfJ5laHAWIktmsVGbOqHGDytPB/NqxCHFQfICsMYjU3ENoh4taLSCAIuffzxMz6YoOUeqv4zc/rHj357j0ctiMEkbvkcLADccd5bEdJLkbNQ4KMzUb3NLgpxdcsy1JOPnR1hL7nUlJPAwOD6/gtT8Lk3wqfbOdrvmfYVveaDLok2xSUNQd7ilGcDTMXFMq6/KfKkB4WASYrFr4NYTmvNe2j8yk7yV/cN1f74+dbjJ4GsoTrVq59lxtvABFDZKcW9UjGnWczc2fFwIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "activeTab",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AgentBridge — Control your browser with AI Agents",
+    "default_popup": "panel.html"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
