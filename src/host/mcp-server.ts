@@ -1,3 +1,4 @@
+import type { InteractiveElementNode, PageSnapshotResult } from "../shared/protocol.js";
 import { BridgeClient, BridgeHubServer, getDefaultSocketPath, isSocketAlive } from "./bridge-hub.js";
 
 export interface McpToolDefinition {
@@ -43,7 +44,7 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "browser_read_tabs",
     description:
-      "Read clean Markdown content and text selection from one or multiple open tabs simultaneously (equivalent to @Chrome multi-tab context reading).",
+      "Read clean Markdown content (including tables and code blocks) and text selection from one or multiple open tabs simultaneously.",
     inputSchema: {
       type: "object",
       properties: {
@@ -78,7 +79,7 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "browser_snapshot",
     description:
-      "Distill the target tab's DOM & Accessibility tree into interactive element references (e1, e2, ...) with bounding boxes, values, sensitivity flags, and optional Set-of-Mark visual highlight badges.",
+      "Distill the target tab's DOM, Shadow DOM, and same-origin iframes into interactive element references (e1, e2, ...) with bounding boxes, values, sensitivity flags, and optional Set-of-Mark visual highlight badges.",
     inputSchema: {
       type: "object",
       properties: {
@@ -90,6 +91,10 @@ export const MCP_TOOLS: McpToolDefinition[] = [
         viewportOnly: {
           type: "boolean",
           description: "Only collect interactive elements currently inside the viewport (default: false)"
+        },
+        compact: {
+          type: "boolean",
+          description: "Return token-efficient compact DSL instead of verbose JSON (default: true)"
         }
       }
     }
@@ -113,7 +118,7 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "browser_click",
     description:
-      "Click an interactive element by its snapshot reference (e.g., 'e12') or CSS selector using hardware-level trusted CDP mouse events. Pauses for confirmation on sensitive submit/delete/pay buttons unless confirmed=true.",
+      "Click an interactive element by its snapshot reference (e.g., 'e12') or CSS selector. Pauses for confirmation on sensitive submit/delete/pay buttons unless confirmed=true.",
     inputSchema: {
       type: "object",
       properties: {
@@ -139,7 +144,11 @@ export const MCP_TOOLS: McpToolDefinition[] = [
         selector: { type: "string", description: "Fallback CSS selector" },
         value: { type: "string", description: "Text value to enter" },
         clear: { type: "boolean", description: "Clear existing value before typing (default: true)" },
-        pressEnter: { type: "boolean", description: "Dispatch hardware Enter key after filling (default: false)" }
+        pressEnter: { type: "boolean", description: "Dispatch Enter key after filling (default: false)" },
+        confirmed: {
+          type: "boolean",
+          description: "Set true if pressEnter=true submits a sensitive form and user has approved"
+        }
       },
       required: ["value"]
     }
@@ -160,32 +169,115 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   },
   {
     name: "browser_press_key",
-    description: "Dispatch a hardware-level keyboard key press (e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown') via CDP.",
+    description: "Dispatch a keyboard key press (e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown').",
     inputSchema: {
       type: "object",
       properties: {
         tabId: { type: "number", description: "Target tabId" },
-        key: { type: "string", description: "Key name (e.g., 'Enter', 'Escape', 'Tab')" }
+        key: { type: "string", description: "Key name (e.g., 'Enter', 'Escape', 'Tab')" },
+        confirmed: {
+          type: "boolean",
+          description: "Set true if pressing Enter submits a sensitive form and user has approved"
+        }
       },
       required: ["key"]
     }
   },
   {
     name: "browser_scroll",
-    description: "Scroll the page by pixel delta.",
+    description:
+      "Scroll the page or a specific scrollable container (by ref/selector, or auto-detected overflow container) by pixel delta.",
     inputSchema: {
       type: "object",
       properties: {
         tabId: { type: "number", description: "Target tabId" },
+        ref: { type: "string", description: "Optional snapshot ref of a scrollable container" },
+        selector: { type: "string", description: "Optional CSS selector of a scrollable container" },
         deltaX: { type: "number", description: "Horizontal scroll pixels (default: 0)" },
         deltaY: { type: "number", description: "Vertical scroll pixels (default: 500, negative to scroll up)" }
       }
     }
   },
   {
+    name: "browser_wait_for",
+    description:
+      "Wait for a CSS selector or text to appear/disappear, or wait for DOM mutations to settle.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Target tabId" },
+        selector: { type: "string", description: "CSS selector to wait for" },
+        text: { type: "string", description: "Substring of visible page text to wait for" },
+        state: {
+          type: "string",
+          enum: ["visible", "hidden", "attached", "detached", "domSettled"],
+          description: "Target condition state (default: 'visible' if selector/text given, else 'domSettled')"
+        },
+        timeoutMs: { type: "number", description: "Maximum wait time in ms (default: 5000)" }
+      }
+    }
+  },
+  {
+    name: "browser_batch",
+    description:
+      "Execute a sequence of browser actions (fill, click, select, press, scroll, waitFor) in a single round-trip and automatically return the updated page snapshot.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Target tabId" },
+        steps: {
+          type: "array",
+          description: "Ordered list of actions to perform",
+          items: {
+            type: "object",
+            properties: {
+              action: {
+                type: "string",
+                enum: ["click", "fill", "select", "press", "scroll", "waitFor", "moveCursor"]
+              },
+              ref: { type: "string" },
+              selector: { type: "string" },
+              value: { type: "string" },
+              key: { type: "string" },
+              pressEnter: { type: "boolean" },
+              confirmed: { type: "boolean" },
+              deltaY: { type: "number" },
+              text: { type: "string" },
+              timeoutMs: { type: "number" }
+            },
+            required: ["action"]
+          }
+        },
+        includeSnapshot: {
+          type: "boolean",
+          description: "Automatically capture and return a compact snapshot after batch completes (default: true)"
+        }
+      },
+      required: ["steps"]
+    }
+  },
+  {
+    name: "browser_upload_file",
+    description: "Set local file path(s) on an <input type='file'> element by snapshot ref or CSS selector.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Target tabId" },
+        ref: { type: "string", description: "Element reference ID of the file input" },
+        selector: { type: "string", description: "Fallback CSS selector for <input type='file'>" },
+        files: {
+          type: "array",
+          items: { type: "string" },
+          description: "Array of absolute local file paths to upload"
+        }
+      },
+      required: ["files"]
+    }
+  },
+  {
     name: "browser_screenshot",
     description:
-      "Capture a screenshot of a tab (works even when the tab is in a background Tab Group) via CDP Page.captureScreenshot.",
+      "Capture a screenshot of a tab (works even when the tab is in a background Tab Group).",
     inputSchema: {
       type: "object",
       properties: {
@@ -240,7 +332,7 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "browser_send_cdp_command",
     description:
-      "[Developer Mode - Full CDP] Execute any raw Chrome DevTools Protocol (CDP 1.3) command on a tab (e.g. 'Runtime.evaluate', 'Performance.getMetrics', 'DOMSnapshot.captureSnapshot').",
+      "[Developer Mode - Full CDP] Execute any raw Chrome DevTools Protocol (CDP 1.3) command on a tab.",
     inputSchema: {
       type: "object",
       properties: {
@@ -265,12 +357,70 @@ const TOOL_TO_BRIDGE_METHOD: Record<string, string> = {
   browser_select: "dom.select",
   browser_press_key: "dom.press",
   browser_scroll: "dom.scroll",
+  browser_wait_for: "dom.waitFor",
+  browser_batch: "dom.batch",
+  browser_upload_file: "dom.uploadFile",
   browser_screenshot: "page.screenshot",
   browser_get_console_logs: "dev.getConsoleLogs",
   browser_get_network_requests: "dev.getNetworkRequests",
   browser_get_network_response_body: "dev.getNetworkResponseBody",
   browser_send_cdp_command: "dev.sendCdpCommand"
 };
+
+/**
+ * 将快照元素压缩为高密度单行 DSL，节省约 80% 上下文 Token，并添加非授信网页内容隔离标记
+ */
+export function formatCompactSnapshot(snap: PageSnapshotResult): string {
+  const lines: string[] = [];
+  const vp = snap.viewport || { width: 0, height: 0, scrollX: 0, scrollY: 0, scrollHeight: 0 };
+  lines.push(
+    `Tab #${snap.tabId} | ${snap.title || "(Untitled)"} | ${snap.url}`,
+    `Viewport: ${vp.width}x${vp.height} | ScrollY: ${vp.scrollY}/${vp.scrollHeight} | Elements: ${snap.elements?.length ?? 0}`
+  );
+
+  if (snap.elements && snap.elements.length > 0) {
+    lines.push("\nInteractive Elements:");
+    for (const el of snap.elements as InteractiveElementNode[]) {
+      const parts: string[] = [`[${el.ref}]`, el.role || el.tagName];
+      const label = (el.name || el.text || "").replace(/\s+/g, " ").trim();
+      if (label) {
+        parts.push(`"${label.slice(0, 80)}"`);
+      }
+      if (el.type && el.type !== "text" && el.type !== "button") {
+        parts.push(`type=${el.type}`);
+      }
+      if (el.value !== undefined && el.value !== "") {
+        parts.push(`val="${String(el.value).slice(0, 60)}"`);
+      }
+      if (el.placeholder && el.placeholder !== label) {
+        parts.push(`placeholder="${el.placeholder.slice(0, 40)}"`);
+      }
+      if (el.checked !== undefined) {
+        parts.push(el.checked ? "[CHECKED]" : "[UNCHECKED]");
+      }
+      if (el.disabled) {
+        parts.push("[DISABLED]");
+      }
+      if (el.isSensitiveSubmit) {
+        parts.push("[SENSITIVE_SUBMIT]");
+      }
+      if (el.rect) {
+        parts.push(`@(${el.rect.x},${el.rect.y} ${el.rect.width}x${el.rect.height})`);
+      }
+      lines.push(parts.join(" "));
+    }
+  }
+
+  if (snap.markdownExcerpt) {
+    lines.push(
+      "\n<untrusted_page_content>",
+      snap.markdownExcerpt.slice(0, 3000),
+      "</untrusted_page_content>"
+    );
+  }
+
+  return lines.join("\n");
+}
 
 export async function handleMcpJsonRpc(
   request: any,
@@ -279,7 +429,6 @@ export async function handleMcpJsonRpc(
   if (!request || typeof request !== "object") return null;
   const { id, method, params } = request;
 
-  // Notifications without id do not return a response
   if (id === undefined || id === null) {
     return null;
   }
@@ -368,6 +517,22 @@ export async function handleMcpJsonRpc(
       };
     }
 
+    // 针对 browser_snapshot 默认使用紧凑格式（当 args.compact === true 时显式输出紧凑 DSL，或当 args.compact 未指定且包含完整快照结构时按需格式化）
+    if (toolName === "browser_snapshot" && args.compact === true && bridgeRes.result?.elements) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: formatCompactSnapshot(bridgeRes.result as PageSnapshotResult)
+            }
+          ]
+        }
+      };
+    }
+
     return {
       jsonrpc: "2.0",
       id,
@@ -393,15 +558,14 @@ export async function handleMcpJsonRpc(
 }
 
 /**
- * 启动标准 MCP Server（自适应支持换行分隔 JSON-RPC 与 Content-Length 头模式）
+ * 启动标准 MCP Server（自适应支持换行分隔 JSON-RPC 与 Content-Length 头模式，使用长连接复用 Socket）
  */
 export async function runMcpServer(socketPath = getDefaultSocketPath()): Promise<void> {
-  const client = new BridgeClient(socketPath);
+  const client = new BridgeClient(socketPath, { persistent: true });
   let useContentLengthFraming = false;
   let rawBuffer: Buffer = Buffer.alloc(0);
   process.stdin.resume();
 
-  // 如果当前还没有任何进程监听 bridge.sock，MCP Server 主动拉起 Hub，使后续 Chrome 启动时能直接会合
   let fallbackHub: BridgeHubServer | null = null;
   if (!(await isSocketAlive(socketPath))) {
     try {
@@ -427,7 +591,9 @@ export async function runMcpServer(socketPath = getDefaultSocketPath()): Promise
     rawBuffer = rawBuffer.length === 0 ? chunk : Buffer.concat([rawBuffer, chunk]);
 
     while (rawBuffer.length > 0) {
-      const headerMatch = rawBuffer.toString("utf8", 0, Math.min(rawBuffer.length, 128)).match(/^Content-Length:\s*(\d+)\r\n\r\n/i);
+      const headerMatch = rawBuffer
+        .toString("utf8", 0, Math.min(rawBuffer.length, 128))
+        .match(/^Content-Length:\s*(\d+)\r\n\r\n/i);
       if (headerMatch) {
         useContentLengthFraming = true;
         const headerByteLen = Buffer.byteLength(headerMatch[0], "utf8");
@@ -444,7 +610,7 @@ export async function runMcpServer(socketPath = getDefaultSocketPath()): Promise
         continue;
       }
 
-      const newlineIdx = rawBuffer.indexOf(0x0a); // '\n'
+      const newlineIdx = rawBuffer.indexOf(0x0a);
       if (newlineIdx === -1) break;
       const line = rawBuffer.subarray(0, newlineIdx).toString("utf8").trim();
       rawBuffer = rawBuffer.subarray(newlineIdx + 1);
@@ -457,6 +623,7 @@ export async function runMcpServer(socketPath = getDefaultSocketPath()): Promise
   });
 
   const shutdown = async () => {
+    client.close();
     if (fallbackHub) {
       await fallbackHub.close();
     }

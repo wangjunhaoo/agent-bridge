@@ -1,7 +1,9 @@
 import { NATIVE_HOST_NAME } from "../shared/extension-identity.js";
 import {
   DEFAULT_GUARD_CONFIG,
+  isUrlAllowed,
   type AuditLogItem,
+  type BatchActionStep,
   type ConsoleLogEntry,
   type ExtensionGuardConfig,
   type NetworkRequestEntry,
@@ -29,6 +31,7 @@ let lastNativeError: string | null = null;
 let guardConfig: ExtensionGuardConfig = { ...DEFAULT_GUARD_CONFIG };
 let lastControlledTabId: number | null = null;
 const injectedTabsInSession = new Set<number>();
+const stealthPatchedTabs = new Set<number>();
 const tabTelemetry = new Map<number, TabTelemetryState>();
 const auditLogs: AuditLogItem[] = [];
 
@@ -58,17 +61,24 @@ async function saveGuardConfig(partial: Partial<ExtensionGuardConfig>): Promise<
   return guardConfig;
 }
 
+async function detachTabDebugger(tabId: number): Promise<void> {
+  const state = tabTelemetry.get(tabId);
+  if (!state || !state.attached) return;
+  await new Promise<void>((resolve) => {
+    chrome.debugger.detach({ tabId }, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+  state.attached = false;
+  state.domainsEnabled = false;
+  broadcastUiState();
+}
+
 async function detachAllDebuggers(): Promise<void> {
   for (const [tabId, state] of tabTelemetry.entries()) {
     if (state.attached) {
-      await new Promise<void>((resolve) => {
-        chrome.debugger.detach({ tabId }, () => {
-          void chrome.runtime.lastError;
-          resolve();
-        });
-      });
-      state.attached = false;
-      state.domainsEnabled = false;
+      await detachTabDebugger(tabId);
     }
   }
 }
@@ -107,44 +117,7 @@ function broadcastUiState(): void {
     });
 }
 
-export function isUrlAllowed(url: string | undefined, config: ExtensionGuardConfig): {
-  allowed: boolean;
-  reason?: string;
-} {
-  if (!url) return { allowed: true };
-  const lower = url.toLowerCase();
-
-  for (const blocked of config.blockedDomains) {
-    const pattern = blocked.trim().toLowerCase();
-    if (!pattern) continue;
-    if (lower.startsWith(pattern) || lower.includes(pattern)) {
-      return {
-        allowed: false,
-        reason: `URL "${url}" matches blocked domain/prefix "${blocked}"`
-      };
-    }
-  }
-
-  if (config.allowedDomains.length > 0) {
-    let matched = false;
-    for (const allowed of config.allowedDomains) {
-      const pattern = allowed.trim().toLowerCase();
-      if (!pattern) continue;
-      if (lower.includes(pattern)) {
-        matched = true;
-        break;
-      }
-    }
-    if (!matched) {
-      return {
-        allowed: false,
-        reason: `URL "${url}" is not in allowedDomains list`
-      };
-    }
-  }
-
-  return { allowed: true };
-}
+export { isUrlAllowed };
 
 function getOrCreateTelemetry(tabId: number): TabTelemetryState {
   let state = tabTelemetry.get(tabId);
@@ -169,7 +142,11 @@ function pushConsoleLog(tabId: number, entry: ConsoleLogEntry): void {
   }
 }
 
-function upsertNetworkRequest(tabId: number, requestId: string, updater: (prev?: NetworkRequestEntry) => NetworkRequestEntry): void {
+function upsertNetworkRequest(
+  tabId: number,
+  requestId: string,
+  updater: (prev?: NetworkRequestEntry) => NetworkRequestEntry
+): void {
   const state = getOrCreateTelemetry(tabId);
   const existing = state.networkRequests.get(requestId);
   const next = updater(existing);
@@ -183,10 +160,31 @@ function upsertNetworkRequest(tabId: number, requestId: string, updater: (prev?:
   }
 }
 
-// 监听 CDP 调试事件（Network / Console / Runtime 异常）
+// 监听 CDP 调试事件（Network / Console / Runtime 异常 / 原生弹窗防死锁）
 chrome.debugger.onEvent.addListener((source, method, params: any) => {
   const tabId = source.tabId;
   if (!tabId) return;
+
+  if (method === "Page.javascriptDialogOpening") {
+    // 自动处理同步 alert/confirm/prompt 弹窗，防止页面 JS 线程死锁阻塞 RPC
+    const dialogType = params.type || "alert";
+    const message = params.message || "";
+    pushConsoleLog(tabId, {
+      timestamp: Date.now(),
+      level: "warn",
+      text: `[Auto-Dismissed ${dialogType} Dialog]: ${message}`,
+      url: params.url
+    });
+    chrome.debugger.sendCommand(
+      { tabId },
+      "Page.handleJavaScriptDialog",
+      { accept: dialogType !== "confirm" ? true : false },
+      () => {
+        void chrome.runtime.lastError;
+      }
+    );
+    return;
+  }
 
   if (method === "Runtime.consoleAPICalled") {
     const text = (params.args || [])
@@ -275,6 +273,7 @@ chrome.debugger.onDetach.addListener((source) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabTelemetry.delete(tabId);
   injectedTabsInSession.delete(tabId);
+  stealthPatchedTabs.delete(tabId);
   if (lastControlledTabId === tabId) {
     lastControlledTabId = null;
   }
@@ -283,6 +282,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
     injectedTabsInSession.delete(tabId);
+    stealthPatchedTabs.delete(tabId);
   }
 });
 
@@ -298,7 +298,12 @@ async function sendCdp<T = any>(tabId: number, method: string, commandParams: Re
   });
 }
 
-async function ensureDebuggerAttached(tabId: number, enableTelemetryDomains = true): Promise<void> {
+/**
+ * 按需挂载 CDP：
+ * - 默认 enableTelemetryDomains = false（仅用于硬件级 Input 事件、截图或文件上传，绝不启用 Runtime.enable，规避反爬探针）；
+ * - 仅在显式调用 console/network 遥测工具时才启用 Runtime/Network 域。
+ */
+async function ensureDebuggerAttached(tabId: number, enableTelemetryDomains = false): Promise<void> {
   const state = getOrCreateTelemetry(tabId);
   if (!state.attached) {
     await new Promise<void>((resolve, reject) => {
@@ -331,16 +336,102 @@ async function ensureDebuggerAttached(tabId: number, enableTelemetryDomains = tr
   }
 }
 
+/**
+ * 在受控 Tab 的 Main World 注入隐身与防死锁环境对齐：
+ * 1. 对齐后台标签页的 visibilityState / hidden / hasFocus（带原生 Function.prototype.toString 伪装），防止因后台静默操作被识破；
+ * 2. 防止同步 alert/confirm/prompt 阻塞主线程。
+ */
+async function ensureStealthMainWorldPatch(tabId: number): Promise<void> {
+  if (!guardConfig.stealthMode || stealthPatchedTabs.has(tabId)) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        try {
+          const docProto = Document.prototype;
+          const nativeToString = Function.prototype.toString;
+          const patchedFns = new WeakMap<Function, string>();
+
+          const markNative = <T extends Function>(fn: T, name: string): T => {
+            patchedFns.set(fn, `function ${name}() { [native code] }`);
+            return fn;
+          };
+
+          const customToString = function (this: Function) {
+            if (patchedFns.has(this)) {
+              return patchedFns.get(this)!;
+            }
+            return nativeToString.call(this);
+          };
+          markNative(customToString, "toString");
+          Object.defineProperty(Function.prototype, "toString", {
+            value: customToString,
+            configurable: true,
+            writable: true
+          });
+
+          const getHidden = markNative(function getHidden() {
+            return false;
+          }, "get hidden");
+          const getVisibilityState = markNative(function getVisibilityState() {
+            return "visible";
+          }, "get visibilityState");
+          const hasFocusFn = markNative(function hasFocus() {
+            return true;
+          }, "hasFocus");
+
+          Object.defineProperty(docProto, "hidden", {
+            get: getHidden,
+            configurable: true,
+            enumerable: true
+          });
+          Object.defineProperty(docProto, "visibilityState", {
+            get: getVisibilityState,
+            configurable: true,
+            enumerable: true
+          });
+          Object.defineProperty(docProto, "hasFocus", {
+            value: hasFocusFn,
+            configurable: true,
+            writable: true,
+            enumerable: true
+          });
+        } catch {}
+      }
+    });
+    stealthPatchedTabs.add(tabId);
+  } catch {
+    // 非网页受限协议忽略
+  }
+}
+
+async function rememberControlledTab(tabId: number): Promise<void> {
+  lastControlledTabId = tabId;
+  try {
+    await chrome.storage.session.set({ lastControlledTabId: tabId });
+  } catch {}
+}
+
 async function resolveTargetTab(tabId?: number): Promise<chrome.tabs.Tab> {
   if (tabId !== undefined && tabId !== null && !Number.isNaN(Number(tabId))) {
     const numericId = Number(tabId);
     const tab = await chrome.tabs.get(numericId);
     if (!tab) throw new Error(`Tab ${numericId} not found`);
-    lastControlledTabId = numericId;
+    await rememberControlledTab(numericId);
     return tab;
   }
 
-  // 若调用方未传 tabId，优先复用最近一次由 Agent 打开或拍过快照的受控 Tab（避免误操作用户正在前台看的飞书等页面）
+  // 1. 优先从内存或 session storage 恢复最近一次受控的后台 Tab（防止 MV3 Service Worker 休眠后丢失记忆）
+  if (lastControlledTabId === null) {
+    try {
+      const sess = await chrome.storage.session.get("lastControlledTabId");
+      if (typeof sess?.lastControlledTabId === "number") {
+        lastControlledTabId = sess.lastControlledTabId;
+      }
+    } catch {}
+  }
+
   if (lastControlledTabId !== null) {
     try {
       const remembered = await chrome.tabs.get(lastControlledTabId);
@@ -352,6 +443,20 @@ async function resolveTargetTab(tabId?: number): Promise<chrome.tabs.Tab> {
     }
   }
 
+  // 2. 若无记忆 Tab，优先在专属 'AI Agent' 标签组内查找受控页签，绝不默认触碰用户在组外浏览的前台页面
+  try {
+    const agentGroups = await chrome.tabGroups.query({ title: guardConfig.agentTabGroupTitle });
+    if (agentGroups.length > 0) {
+      const groupTabs = await chrome.tabs.query({ groupId: agentGroups[0].id });
+      const latestAgentTab = groupTabs[groupTabs.length - 1];
+      if (latestAgentTab?.id !== undefined) {
+        await rememberControlledTab(latestAgentTab.id);
+        return latestAgentTab;
+      }
+    }
+  } catch {}
+
+  // 3. 兜底：当前没有任何受控分组页签时才回退至活动页签
   const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (activeTab?.id !== undefined) return activeTab;
 
@@ -376,7 +481,6 @@ async function assertTabAllowed(tab: chrome.tabs.Tab): Promise<number> {
  * 向目标 Tab 的 Content Script 发送消息；若该 Tab 是在插件安装前打开的，自动动态注入 content.js 再重试。
  */
 async function sendContentMessage<T = any>(tabId: number, type: string, payload?: unknown): Promise<T> {
-  // 每次扩展重载后的新会话首次触达存量 Tab 时，主动注入最新构建的 content.js，确保无需刷新网页即刻生效
   if (!injectedTabsInSession.has(tabId)) {
     try {
       await chrome.scripting.executeScript({
@@ -387,6 +491,10 @@ async function sendContentMessage<T = any>(tabId: number, type: string, payload?
     } catch {
       // 某些受限页面无法注入时交由后续 trySend 报错
     }
+  }
+
+  if (guardConfig.stealthMode) {
+    await ensureStealthMainWorldPatch(tabId);
   }
 
   const trySend = () =>
@@ -430,14 +538,17 @@ async function sendContentMessage<T = any>(tabId: number, type: string, payload?
 }
 
 /**
- * 将标签页归入专属后台 Tab Group（如 "AGY Agent"），避免干扰用户当前前台工作区
+ * 将标签页归入专属后台 Tab Group（如 "AI Agent"），避免干扰用户当前前台工作区
  */
 async function assignToAgentTabGroup(tabId: number, windowId?: number): Promise<number> {
   const groups = await chrome.tabGroups.query({
     title: guardConfig.agentTabGroupTitle,
     ...(windowId !== undefined ? { windowId } : {})
   });
-  const existingGroupId = groups[0]?.id;
+  const existingGroup = groups[0];
+  const existingGroupId = existingGroup?.id;
+  const wasCollapsed = existingGroup?.collapsed ?? false;
+
   const groupId = await chrome.tabs.group({
     tabIds: [tabId],
     ...(existingGroupId !== undefined ? { groupId: existingGroupId } : {})
@@ -448,6 +559,9 @@ async function assignToAgentTabGroup(tabId: number, windowId?: number): Promise<
       color: guardConfig.agentTabGroupColor,
       collapsed: false
     });
+  } else if (wasCollapsed) {
+    // 若用户此前手动折叠了 AI Agent 标签组，新加入后台 Tab 后保持折叠状态不打扰用户视线
+    await chrome.tabGroups.update(groupId, { collapsed: true }).catch(() => {});
   }
   return groupId;
 }
@@ -474,12 +588,11 @@ async function waitForTabComplete(tabId: number, timeoutMs = 12000): Promise<voi
 }
 
 /**
- * 统一处理来自 Native Host（MCP / CLI）或扩展面板的 RPC 指令
+ * 统一处理来自 Native Host（MCP / CLI）或扩展面板（Panel）的 RPC 指令
  */
-async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
+async function handleRpcRequest(req: RpcRequest, source: "native" | "panel" = "native"): Promise<RpcResponse> {
   await loadGuardConfig();
 
-  // 元信息与配置管理命令不受 enabled 开关拦截
   if (req.method === "bridge.ping") {
     return {
       id: req.id,
@@ -488,6 +601,7 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
         pong: true,
         extensionId: chrome.runtime.id,
         enabled: guardConfig.enabled,
+        stealthMode: guardConfig.stealthMode,
         developerMode: guardConfig.developerMode,
         timestamp: Date.now()
       }
@@ -528,8 +642,44 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
   }
 
   if (req.method === "guard.updateConfig") {
-    const updated = await saveGuardConfig((req.params || {}) as Partial<ExtensionGuardConfig>);
-    recordAudit(req.method, `Updated guard config (enabled=${updated.enabled}, dev=${updated.developerMode})`, "ok");
+    const incoming = (req.params || {}) as Partial<ExtensionGuardConfig>;
+
+    // 安全边界校验：外部 Native Socket 不允许强行开启已关闭的总开关、不允许关闭敏感确认护栏、不允许篡改域名黑白名单
+    if (source === "native") {
+      if (!guardConfig.enabled && incoming.enabled === true) {
+        recordAudit(req.method, "Blocked external attempt to re-enable master switch", "blocked");
+        return {
+          id: req.id,
+          ok: false,
+          error: {
+            code: "PERMISSION_DENIED",
+            message: "Master switch can only be enabled manually in the Chrome extension panel."
+          }
+        };
+      }
+      if (
+        incoming.confirmBeforeSubmit === false ||
+        incoming.blockedDomains !== undefined ||
+        incoming.allowedDomains !== undefined
+      ) {
+        recordAudit(req.method, "Blocked external attempt to weaken security guardrails", "blocked");
+        return {
+          id: req.id,
+          ok: false,
+          error: {
+            code: "PERMISSION_DENIED",
+            message: "Security guardrails (confirmBeforeSubmit, blockedDomains, allowedDomains) can only be modified in the Chrome extension panel."
+          }
+        };
+      }
+    }
+
+    const updated = await saveGuardConfig(incoming);
+    recordAudit(
+      req.method,
+      `Updated guard config (enabled=${updated.enabled}, stealth=${updated.stealthMode}, dev=${updated.developerMode})`,
+      "ok"
+    );
     return { id: req.id, ok: true, result: updated };
   }
 
@@ -583,14 +733,13 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           };
         }
 
-        // 默认 active: false（后台静默打开不抢占用户焦点，除非调用方显式传 active: true）
         const active = Boolean(params.active ?? false);
         const useTabGroup = params.inAgentGroup !== false;
         const created = await chrome.tabs.create({ url, active });
         if (created.id === undefined) {
           throw new Error("Failed to create tab");
         }
-        lastControlledTabId = created.id;
+        await rememberControlledTab(created.id);
 
         let groupId = created.groupId;
         if (useTabGroup) {
@@ -605,17 +754,27 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           await waitForTabComplete(created.id);
         }
 
-        if (guardConfig.developerMode && params.attachDebugger !== false && url.startsWith("http")) {
-          await ensureDebuggerAttached(created.id, true).catch(() => {});
+        const refreshed = await chrome.tabs.get(created.id);
+        // 二次复核重定向后的最终 URL 是否仍在允许范围内
+        const postRedirectCheck = isUrlAllowed(refreshed.url, guardConfig);
+        if (!postRedirectCheck.allowed) {
+          await chrome.tabs.remove(created.id).catch(() => {});
+          recordAudit(req.method, postRedirectCheck.reason || "Redirected URL blocked", "blocked", created.id);
+          return {
+            id: req.id,
+            ok: false,
+            error: { code: "DOMAIN_BLOCKED", message: postRedirectCheck.reason || "Redirected URL blocked" }
+          };
         }
 
-        if (url.startsWith("http")) {
+        if (refreshed.url?.startsWith("http") && !guardConfig.stealthMode) {
           await sendContentMessage(created.id, "ab:showStage", {
             label: "已接管此标签页"
           }).catch(() => {});
+        } else if (refreshed.url?.startsWith("http") && guardConfig.stealthMode) {
+          await ensureStealthMainWorldPatch(created.id);
         }
 
-        const refreshed = await chrome.tabs.get(created.id);
         recordAudit(req.method, `Opened ${url} in group (${groupId})`, "ok", created.id);
         return {
           id: req.id,
@@ -631,7 +790,6 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
       }
 
       case "tabs.read": {
-        // 支持同时读取单个或多个 Tab（对应 ChatGPT @Chrome 跨标签对比阅读能力）
         const tabIds: number[] = Array.isArray(params.tabIds)
           ? params.tabIds.map(Number)
           : [await assertTabAllowed(await resolveTargetTab(params.tabId))];
@@ -719,7 +877,17 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           await waitForTabComplete(tabId);
         }
         const updated = await chrome.tabs.get(tabId);
-        if (updated.url?.startsWith("http")) {
+        const postNavCheck = isUrlAllowed(updated.url, guardConfig);
+        if (!postNavCheck.allowed) {
+          recordAudit(req.method, postNavCheck.reason || "Blocked URL after navigation", "blocked", tabId);
+          return {
+            id: req.id,
+            ok: false,
+            error: { code: "DOMAIN_BLOCKED", message: postNavCheck.reason || "URL blocked after navigation" }
+          };
+        }
+
+        if (updated.url?.startsWith("http") && !guardConfig.stealthMode) {
           await sendContentMessage(tabId, "ab:showStage", {
             label: "页面加载完成"
           }).catch(() => {});
@@ -780,7 +948,7 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
         );
         if (guardConfig.developerMode) {
           try {
-            await ensureDebuggerAttached(tabId, true);
+            await ensureDebuggerAttached(tabId, false);
             await sendCdp(tabId, "Input.dispatchMouseEvent", {
               type: "mouseMoved",
               x: moveRes.x,
@@ -815,7 +983,6 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           skipClickRipple: true
         });
 
-        // 敏感提交动作护栏：若开启了 confirmBeforeSubmit 且调用方未显式传 confirmed=true，挂起并提示确认
         if (guardConfig.confirmBeforeSubmit && targetInfo.isSensitiveSubmit && !params.confirmed) {
           recordAudit(
             req.method,
@@ -834,7 +1001,6 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           };
         }
 
-        // 播放页面内点击雷达波纹动画
         await sendContentMessage(tabId, "ab:triggerRipple", {
           x: targetInfo.x,
           y: targetInfo.y
@@ -842,7 +1008,8 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
 
         if (guardConfig.developerMode) {
           try {
-            await ensureDebuggerAttached(tabId, true);
+            // 仅使用 Input 域派发硬件级 isTrusted=true 事件，不激活 Runtime.enable
+            await ensureDebuggerAttached(tabId, false);
             const { x, y } = targetInfo;
             await sendCdp(tabId, "Input.dispatchMouseEvent", {
               type: "mouseMoved",
@@ -857,6 +1024,7 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
               button: "left",
               clickCount: 1
             });
+            await new Promise((r) => setTimeout(r, 32 + Math.floor(Math.random() * 28)));
             await sendCdp(tabId, "Input.dispatchMouseEvent", {
               type: "mouseReleased",
               x,
@@ -867,16 +1035,21 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           } catch {
             await sendContentMessage(tabId, "ab:syntheticClick", {
               ref: params.ref,
-              selector: params.selector
+              selector: params.selector,
+              x: targetInfo.x,
+              y: targetInfo.y
             });
           }
         } else {
           await sendContentMessage(tabId, "ab:syntheticClick", {
             ref: params.ref,
-            selector: params.selector
+            selector: params.selector,
+            x: targetInfo.x,
+            y: targetInfo.y
           });
         }
 
+        const afterTab = await chrome.tabs.get(tabId).catch(() => tab);
         recordAudit(
           req.method,
           `Clicked ${params.ref || params.selector} ("${targetInfo.name}") at (${targetInfo.x}, ${targetInfo.y})`,
@@ -889,7 +1062,9 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           result: {
             tabId,
             clicked: params.ref || params.selector,
-            target: targetInfo
+            target: targetInfo,
+            url: afterTab.url || tab.url,
+            title: afterTab.title || tab.title
           }
         };
       }
@@ -898,7 +1073,12 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
         const tab = await resolveTargetTab(params.tabId);
         const tabId = await assertTabAllowed(tab);
         const value = String(params.value ?? "");
-        const fillRes = await sendContentMessage(tabId, "ab:fill", {
+        const fillRes = await sendContentMessage<{
+          tagName: string;
+          value: string;
+          isSensitiveEnter?: boolean;
+          formName?: string;
+        }>(tabId, "ab:fill", {
           ref: params.ref,
           selector: params.selector,
           value,
@@ -906,8 +1086,26 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
         });
 
         if (params.pressEnter) {
+          if (guardConfig.confirmBeforeSubmit && fillRes.isSensitiveEnter && !params.confirmed) {
+            recordAudit(
+              req.method,
+              `Filled ${params.ref || params.selector} but paused before Enter submit on "${fillRes.formName || "form"}"`,
+              "blocked",
+              tabId
+            );
+            return {
+              id: req.id,
+              ok: false,
+              error: {
+                code: "CONFIRMATION_REQUIRED",
+                message: `Safety guardrail: Text was filled into ${params.ref || params.selector}, but pressing Enter will submit form "${fillRes.formName || "form"}". Ask the user for confirmation first, then re-invoke with confirmed: true.`,
+                details: fillRes
+              }
+            };
+          }
+
           if (guardConfig.developerMode) {
-            await ensureDebuggerAttached(tabId, true);
+            await ensureDebuggerAttached(tabId, false);
             await sendCdp(tabId, "Input.dispatchKeyEvent", {
               type: "keyDown",
               key: "Enter",
@@ -949,8 +1147,28 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
         const tab = await resolveTargetTab(params.tabId);
         const tabId = await assertTabAllowed(tab);
         const key = String(params.key || "Enter");
+
+        if (key === "Enter" && guardConfig.confirmBeforeSubmit && !params.confirmed) {
+          const checkRes = await sendContentMessage<{ isSensitive: boolean; formName: string }>(
+            tabId,
+            "ab:checkEnterSensitivity"
+          ).catch(() => ({ isSensitive: false, formName: "" }));
+
+          if (checkRes.isSensitive) {
+            recordAudit(req.method, `Paused before pressing Enter on sensitive form "${checkRes.formName}"`, "blocked", tabId);
+            return {
+              id: req.id,
+              ok: false,
+              error: {
+                code: "CONFIRMATION_REQUIRED",
+                message: `Safety guardrail: Pressing Enter on "${checkRes.formName}" triggers a form submission. Ask the user for confirmation first, then re-invoke with confirmed: true.`
+              }
+            };
+          }
+        }
+
         if (guardConfig.developerMode) {
-          await ensureDebuggerAttached(tabId, true);
+          await ensureDebuggerAttached(tabId, false);
           await sendCdp(tabId, "Input.dispatchKeyEvent", {
             type: "keyDown",
             key,
@@ -973,11 +1191,173 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
         const tab = await resolveTargetTab(params.tabId);
         const tabId = await assertTabAllowed(tab);
         const scrollRes = await sendContentMessage(tabId, "ab:scroll", {
+          ref: params.ref,
+          selector: params.selector,
           deltaX: params.deltaX ?? 0,
           deltaY: params.deltaY ?? 500
         });
         recordAudit(req.method, `Scrolled tab #${tabId} by (${params.deltaX ?? 0}, ${params.deltaY ?? 500})`, "ok", tabId);
         return { id: req.id, ok: true, result: { tabId, ...scrollRes } };
+      }
+
+      case "dom.waitFor": {
+        const tab = await resolveTargetTab(params.tabId);
+        const tabId = await assertTabAllowed(tab);
+        const waitRes = await sendContentMessage(tabId, "ab:waitFor", {
+          selector: params.selector,
+          text: params.text,
+          state: params.state,
+          timeoutMs: params.timeoutMs
+        });
+        recordAudit(
+          req.method,
+          `Waited on tab #${tabId} (matched=${waitRes.matched}, ${waitRes.elapsedMs}ms)`,
+          "ok",
+          tabId
+        );
+        return { id: req.id, ok: true, result: { tabId, ...waitRes } };
+      }
+
+      case "dom.uploadFile": {
+        const tab = await resolveTargetTab(params.tabId);
+        const tabId = await assertTabAllowed(tab);
+        const files: string[] = Array.isArray(params.files)
+          ? params.files.map(String)
+          : params.filePath
+            ? [String(params.filePath)]
+            : [];
+        if (files.length === 0) {
+          throw new Error("files array or filePath is required for dom.uploadFile");
+        }
+
+        const prep = await sendContentMessage<{ selector: string; token: string }>(
+          tabId,
+          "ab:prepareFileUpload",
+          {
+            ref: params.ref,
+            selector: params.selector
+          }
+        );
+
+        const wasAttached = tabTelemetry.get(tabId)?.attached ?? false;
+        try {
+          await ensureDebuggerAttached(tabId, false);
+          const docRoot = await sendCdp<{ root: { nodeId: number } }>(tabId, "DOM.getDocument", { depth: 0 });
+          const nodeRes = await sendCdp<{ nodeId: number }>(tabId, "DOM.querySelector", {
+            nodeId: docRoot.root.nodeId,
+            selector: prep.selector
+          });
+          if (!nodeRes?.nodeId) {
+            throw new Error("Failed to resolve DOM nodeId for file upload input");
+          }
+          await sendCdp(tabId, "DOM.setFileInputFiles", {
+            nodeId: nodeRes.nodeId,
+            files
+          });
+        } finally {
+          await sendContentMessage(tabId, "ab:cleanupFileUpload", { token: prep.token }).catch(() => {});
+          if (!guardConfig.developerMode && !wasAttached) {
+            await detachTabDebugger(tabId);
+          }
+        }
+
+        recordAudit(req.method, `Uploaded ${files.length} file(s) to ${params.ref || params.selector}`, "ok", tabId);
+        return { id: req.id, ok: true, result: { tabId, uploadedFiles: files } };
+      }
+
+      case "dom.batch": {
+        const tab = await resolveTargetTab(params.tabId);
+        const tabId = await assertTabAllowed(tab);
+        const steps: BatchActionStep[] = Array.isArray(params.steps) ? params.steps : [];
+        if (steps.length === 0) {
+          throw new Error("steps array is required for dom.batch");
+        }
+
+        const stepResults: Array<{ index: number; action: string; ok: boolean; result?: unknown }> = [];
+
+        for (let i = 0; i < steps.length; i++) {
+          const step = steps[i];
+          const methodMap: Record<BatchActionStep["action"], string> = {
+            click: "dom.click",
+            fill: "dom.fill",
+            select: "dom.select",
+            press: "dom.press",
+            scroll: "dom.scroll",
+            waitFor: "dom.waitFor",
+            moveCursor: "dom.moveCursor"
+          };
+          const subMethod = methodMap[step.action];
+          if (!subMethod) {
+            throw new Error(`Unsupported batch step action "${step.action}" at index ${i}`);
+          }
+
+          const subRes = await handleRpcRequest(
+            {
+              id: `${req.id}-step-${i}`,
+              method: subMethod,
+              params: { ...step, tabId }
+            },
+            source
+          );
+
+          if (!subRes.ok) {
+            return {
+              id: req.id,
+              ok: false,
+              error: {
+                code: subRes.error?.code || "BATCH_STEP_FAILED",
+                message: `Batch stopped at step #${i + 1} (${step.action}): ${subRes.error?.message}`,
+                details: {
+                  failedStepIndex: i,
+                  completedSteps: stepResults,
+                  stepError: subRes.error
+                }
+              }
+            };
+          }
+
+          stepResults.push({
+            index: i,
+            action: step.action,
+            ok: true,
+            result: subRes.result
+          });
+        }
+
+        // 批量操作结束后等待 DOM 短暂稳定（150ms），并可选附带最新页面快照
+        await sendContentMessage(tabId, "ab:waitFor", {
+          state: "domSettled",
+          settleMs: 140,
+          timeoutMs: 1200
+        }).catch(() => {});
+
+        let postSnapshot: PageSnapshotResult | undefined;
+        if (params.includeSnapshot !== false) {
+          const rawSnap = await sendContentMessage<Omit<PageSnapshotResult, "tabId">>(
+            tabId,
+            "ab:snapshot",
+            {
+              highlight: Boolean(params.highlight ?? false),
+              viewportOnly: Boolean(params.viewportOnly ?? false),
+              maxElements: 120
+            }
+          ).catch(() => undefined);
+          if (rawSnap) {
+            postSnapshot = { tabId, ...rawSnap };
+          }
+        }
+
+        recordAudit(req.method, `Executed batch of ${steps.length} actions on tab #${tabId}`, "ok", tabId);
+        return {
+          id: req.id,
+          ok: true,
+          result: {
+            tabId,
+            completedCount: stepResults.length,
+            steps: stepResults,
+            snapshot: postSnapshot
+          }
+        };
       }
 
       case "page.screenshot": {
@@ -999,22 +1379,30 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
           };
         }
 
-        await ensureDebuggerAttached(tabId, guardConfig.developerMode);
-        const screenshot = await sendCdp<{ data: string }>(tabId, "Page.captureScreenshot", {
-          format,
-          ...(format === "jpeg" ? { quality: Number(params.quality ?? 80) } : {}),
-          captureBeyondViewport: Boolean(params.fullPage ?? false)
-        });
-        recordAudit(req.method, `Captured ${format.toUpperCase()} screenshot of tab #${tabId}`, "ok", tabId);
-        return {
-          id: req.id,
-          ok: true,
-          result: {
-            tabId,
+        // 后台截图使用最小化 CDP 连接（不启用 Runtime.enable），并在非 Dev 模式下拍完即卸，不留顶部调试横幅
+        const wasAttached = tabTelemetry.get(tabId)?.attached ?? false;
+        try {
+          await ensureDebuggerAttached(tabId, false);
+          const screenshot = await sendCdp<{ data: string }>(tabId, "Page.captureScreenshot", {
             format,
-            base64Data: screenshot.data
+            ...(format === "jpeg" ? { quality: Number(params.quality ?? 80) } : {}),
+            captureBeyondViewport: Boolean(params.fullPage ?? false)
+          });
+          recordAudit(req.method, `Captured ${format.toUpperCase()} screenshot of tab #${tabId}`, "ok", tabId);
+          return {
+            id: req.id,
+            ok: true,
+            result: {
+              tabId,
+              format,
+              base64Data: screenshot.data
+            }
+          };
+        } finally {
+          if (!guardConfig.developerMode && !wasAttached) {
+            await detachTabDebugger(tabId);
           }
-        };
+        }
       }
 
       case "dev.getConsoleLogs": {
@@ -1105,7 +1493,7 @@ async function handleRpcRequest(req: RpcRequest): Promise<RpcResponse> {
         const tabId = await assertTabAllowed(tab);
         const cdpMethod = String(params.cdpMethod || "");
         if (!cdpMethod) throw new Error("cdpMethod is required");
-        await ensureDebuggerAttached(tabId, true);
+        await ensureDebuggerAttached(tabId, false);
         const cdpResult = await sendCdp(tabId, cdpMethod, (params.cdpParams as Record<string, unknown>) || {});
         recordAudit(req.method, `Executed raw CDP "${cdpMethod}" on tab #${tabId}`, "ok", tabId);
         return { id: req.id, ok: true, result: { tabId, cdpMethod, response: cdpResult } };
@@ -1145,7 +1533,6 @@ function connectNativeHost(): void {
     lastNativeError = null;
     broadcastUiState();
 
-    // 发送初始握手消息
     port.postMessage({
       type: "extension:hello",
       extensionId: chrome.runtime.id,
@@ -1156,7 +1543,7 @@ function connectNativeHost(): void {
     port.onMessage.addListener((msg: any) => {
       if (!msg || typeof msg !== "object") return;
       if (msg.id && msg.method) {
-        handleRpcRequest(msg as RpcRequest).then((res) => {
+        handleRpcRequest(msg as RpcRequest, "native").then((res) => {
           try {
             port.postMessage(res);
           } catch {
@@ -1182,9 +1569,12 @@ function connectNativeHost(): void {
   }
 }
 
-// 面板（Popup / SidePanel）内部通信监听
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+// 面板（Popup / SidePanel）内部通信监听，严格校验消息来源为扩展自身且非网页 Tab
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string" || !message.type.startsWith("ab-panel:")) {
+    return false;
+  }
+  if (sender.id !== chrome.runtime.id || sender.tab) {
     return false;
   }
 
@@ -1220,7 +1610,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "ab-panel:rpc") {
-    handleRpcRequest(message.payload as RpcRequest).then(sendResponse);
+    handleRpcRequest(message.payload as RpcRequest, "panel").then(sendResponse);
     return true;
   }
 
@@ -1245,7 +1635,6 @@ chrome.runtime.onStartup.addListener(() => {
   });
 });
 
-// 模块加载时立即初始化
 loadGuardConfig().then(() => {
   connectNativeHost();
 });

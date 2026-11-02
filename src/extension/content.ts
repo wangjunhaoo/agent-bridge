@@ -1,15 +1,13 @@
 import type { InteractiveElementNode, PageSnapshotResult } from "../shared/protocol.js";
 
-const REF_ATTR = "data-agent-ref";
-const REF_ATTR_ALIAS = "data-agent-bridge-ref";
-const STAGE_HOST_ID = "__agent_bridge_stage_host__";
-
 /**
- * 内存级快照元素索引：
- * 解决 (1) Shadow DOM 节点 querySelector 无法穿透、(2) React/Vue 动态重渲染导致 DOM 节点替换后报 Element not found
+ * 纯 Isolated World 内存级快照元素索引：
+ * 彻底不在宿主页面 DOM 节点上写入任何 data-agent-* 属性，也不暴露任何固定 ID，
+ * 使网页 Main World 的 MutationObserver 与 querySelector 100% 无法探测到扩展痕迹。
  */
 const snapshotElementMap = new Map<string, HTMLElement>();
 const snapshotMetaMap = new Map<string, InteractiveElementNode>();
+const snapshotOffsetMap = new Map<string, { x: number; y: number }>();
 
 function isPageHidden(): boolean {
   return document.hidden || document.visibilityState !== "visible";
@@ -19,7 +17,7 @@ const SENSITIVE_SUBMIT_PATTERN =
   /\b(submit|send|pay|purchase|checkout|delete|remove|confirm|publish|transfer|authorize|提交|发送|支付|付款|结算|删除|移除|确认|发布|转账|授权)\b/i;
 
 /**
- * 页面内视觉舞台状态（维护虚拟光标位置、Shadow DOM 节点与动画队列）
+ * 页面内视觉舞台状态（维护虚拟光标位置、Closed Shadow DOM 节点与动画队列）
  */
 interface AgentStageState {
   hostEl: HTMLElement;
@@ -271,22 +269,27 @@ const STAGE_CSS = `
   }
 `;
 
+function isStageNode(el: Element): boolean {
+  return Boolean(stageState && (el === stageState.hostEl || stageState.hostEl.contains(el)));
+}
+
 /**
- * 确保页面内已挂载 Shadow DOM 视觉舞台（含呼吸边框、虚拟鼠标、目标吸附框与底部 HUD）
+ * 确保页面内已挂载 Closed Shadow DOM 视觉舞台（无任何 ID/Class 特征，网页 JS 无法访问 shadowRoot）
  */
 function ensureAgentStage(): AgentStageState {
   if (stageState && document.documentElement.contains(stageState.hostEl)) {
     return stageState;
   }
 
-  const existing = document.getElementById(STAGE_HOST_ID);
-  if (existing) existing.remove();
-  const legacyHost = document.getElementById("__agent_bridge_legacy_host__");
-  if (legacyHost) legacyHost.remove();
+  // 清理可能残留的旧版节点
+  const legacy1 = document.getElementById("__agent_bridge_stage_host__");
+  if (legacy1) legacy1.remove();
+  const legacy2 = document.getElementById("__agent_bridge_legacy_host__");
+  if (legacy2) legacy2.remove();
 
+  // 创建无任何 id/class/attribute 特征的宿主节点，并使用 mode: "closed" 彻底屏蔽网页脚本探测
   const hostEl = document.createElement("div");
-  hostEl.id = STAGE_HOST_ID;
-  const shadow = hostEl.attachShadow({ mode: "open" });
+  const shadow = hostEl.attachShadow({ mode: "closed" });
 
   const styleEl = document.createElement("style");
   styleEl.textContent = STAGE_CSS;
@@ -305,7 +308,6 @@ function ensureAgentStage(): AgentStageState {
 
   const cursorArrowEl = document.createElement("div");
   cursorArrowEl.className = "ab-cursor-arrow";
-  // 高辨识度 AI 矢量光标（蓝黑渐变填充 + 高亮白边）
   cursorArrowEl.innerHTML = `
     <svg viewBox="0 0 28 28" width="26" height="26" fill="none" xmlns="http://www.w3.org/2000/svg">
       <defs>
@@ -359,7 +361,6 @@ function ensureAgentStage(): AgentStageState {
 
   document.documentElement.appendChild(hostEl);
 
-  // 初始位置设在右上角扩展栏下方，首次激活时会沿大弧线飞入页面中心
   const initX = Math.max(120, Math.round(window.innerWidth - 72));
   const initY = 28;
   cursorWrapEl.style.transform = `translate3d(${initX}px, ${initY}px, 0)`;
@@ -382,7 +383,8 @@ function ensureAgentStage(): AgentStageState {
   return stageState;
 }
 
-function setStageActionLabel(cursorLabel: string, hudLabel?: string): void {
+function setStageActionLabel(cursorLabel: string, hudLabel?: string, forceMount = true): void {
+  if (!forceMount && !stageState) return;
   const st = ensureAgentStage();
   st.glowEl.classList.add("active");
   st.cursorWrapEl.classList.add("visible");
@@ -397,7 +399,7 @@ function setStageActionLabel(cursorLabel: string, hudLabel?: string): void {
   st.hudTextEl.textContent = hudLabel || `AgentBridge · ${cursorLabel}`;
 }
 
-function showTargetLockRing(rect: DOMRect | { x: number; y: number; width: number; height: number }): void {
+function showTargetLockRing(rect: { x: number; y: number; width: number; height: number }): void {
   const st = ensureAgentStage();
   const pad = 4;
   st.targetRingEl.style.left = `${Math.round(rect.x - pad)}px`;
@@ -465,17 +467,16 @@ async function animateCursorTo(
   hudMessage?: string
 ): Promise<void> {
   const st = ensureAgentStage();
-  setStageActionLabel(label, hudMessage);
+  setStageActionLabel(label, hudMessage, true);
 
-  const targetX = Math.max(12, Math.min(window.innerWidth - 28, Math.round(rawTargetX)));
-  const targetY = Math.max(12, Math.min(window.innerHeight - 28, Math.round(rawTargetY)));
+  const targetX = Math.max(8, Math.min(window.innerWidth - 16, Math.round(rawTargetX)));
+  const targetY = Math.max(8, Math.min(window.innerHeight - 16, Math.round(rawTargetY)));
   const startX = st.cursorX;
   const startY = st.cursorY;
   const dx = targetX - startX;
   const dy = targetY - startY;
   const distance = Math.hypot(dx, dy);
 
-  // 后台标签页 (document.hidden) 下 Chrome 会挂起 requestAnimationFrame，直接 0ms 瞬移返回，杜绝后台操控超时
   if (isPageHidden() || distance < 4) {
     st.cursorX = targetX;
     st.cursorY = targetY;
@@ -483,11 +484,11 @@ async function animateCursorTo(
     return;
   }
 
-  // 根据距离自适应动画时长 (380ms ~ 720ms)，让前台肉眼清晰看到拟人加减速弧线滑行
-  const durationMs = Math.min(720, Math.max(380, Math.round(distance * 0.85)));
+  // 自适应滑行时长 (220ms ~ 520ms)，兼顾流畅视觉与高频操作速度
+  const durationMs = Math.min(520, Math.max(220, Math.round(distance * 0.65)));
   const midX = (startX + targetX) / 2;
   const midY = (startY + targetY) / 2;
-  const bend = Math.min(85, distance * 0.18);
+  const bend = Math.min(72, distance * 0.16);
   const normX = -dy / distance;
   const normY = dx / distance;
   const ctrlX = midX + normX * bend;
@@ -508,8 +509,7 @@ async function animateCursorTo(
       resolve();
     };
 
-    // 硬超时守卫：若动画中途用户切走标签页导致 rAF 被 Chrome 挂起，按时强制完成，绝不阻塞 RPC
-    const safetyTimer = setTimeout(finish, durationMs + 80);
+    const safetyTimer = setTimeout(finish, durationMs + 60);
 
     const step = (now: number) => {
       if (settled) return;
@@ -519,7 +519,6 @@ async function animateCursorTo(
       }
       const elapsed = now - startTime;
       const rawT = Math.min(1, elapsed / durationMs);
-      // easeOutCubic + easeInOut 混合平滑曲线
       const t = 1 - Math.pow(1 - rawT, 3);
 
       const invT = 1 - t;
@@ -530,7 +529,7 @@ async function animateCursorTo(
       st.cursorY = curY;
       st.cursorWrapEl.style.transform = `translate3d(${curX.toFixed(1)}px, ${curY.toFixed(1)}px, 0)`;
 
-      if (now - lastTrailTime > 28 && rawT < 0.92) {
+      if (now - lastTrailTime > 32 && rawT < 0.92) {
         lastTrailTime = now;
         spawnTrailDot(curX, curY);
       }
@@ -546,14 +545,40 @@ async function animateCursorTo(
   });
 }
 
+/**
+ * 在目标元素安全盒内生成带近似正态分布微偏移（Jitter）的点击坐标，消除每次点击绝对几何中心的机器特征
+ */
+function computeNaturalTargetPoint(rect: { x: number; y: number; width: number; height: number }): {
+  x: number;
+  y: number;
+} {
+  const centerX = rect.x + rect.width / 2;
+  const centerY = rect.y + rect.height / 2;
+  if (rect.width <= 10 || rect.height <= 10) {
+    return { x: Math.round(centerX), y: Math.round(centerY) };
+  }
+  // 双随机数均值近似三角/高斯分布，限制在中心 [-0.18, +0.18] 宽高范围内
+  const randX = (Math.random() + Math.random() - 1) * 0.18 * rect.width;
+  const randY = (Math.random() + Math.random() - 1) * 0.18 * rect.height;
+  return {
+    x: Math.round(centerX + randX),
+    y: Math.round(centerY + randY)
+  };
+}
+
 function isElementVisible(el: Element, style: CSSStyleDeclaration, rect: DOMRect): boolean {
-  if (style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") < 0.05) {
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.pointerEvents === "none" ||
+    parseFloat(style.opacity || "1") < 0.05 ||
+    parseFloat(style.fontSize || "12") === 0
+  ) {
     return false;
   }
   if (rect.width < 2 || rect.height < 2) {
     return false;
   }
-  // 过滤通过 translateX 移出屏幕左右边界外的隐藏抽屉节点
   if (rect.right <= 4 || rect.left >= window.innerWidth - 4) {
     return false;
   }
@@ -565,7 +590,7 @@ function inferRole(el: HTMLElement): string {
   if (explicitRole) return explicitRole;
   const tag = el.tagName.toLowerCase();
   if (tag === "a" && el.hasAttribute("href")) return "link";
-  if (tag === "button") return "button";
+  if (tag === "button" || tag === "summary") return "button";
   if (tag === "select") return "combobox";
   if (tag === "textarea") return "textbox";
   if (tag === "input") {
@@ -573,43 +598,56 @@ function inferRole(el: HTMLElement): string {
     if (type === "button" || type === "submit" || type === "reset") return "button";
     if (type === "checkbox") return "checkbox";
     if (type === "radio") return "radio";
+    if (type === "file") return "file";
     return "textbox";
   }
   if (el.isContentEditable) return "textbox";
   return tag;
 }
 
-function isInteractiveElement(el: HTMLElement, style: CSSStyleDeclaration): boolean {
+const INTERACTIVE_TAGS = new Set(["button", "select", "textarea", "summary", "a", "input"]);
+const INTERACTIVE_ROLES = new Set([
+  "button",
+  "link",
+  "tab",
+  "menuitem",
+  "option",
+  "checkbox",
+  "radio",
+  "switch",
+  "combobox",
+  "textbox",
+  "searchbox"
+]);
+
+/**
+ * 第一阶段零开销标签/属性初筛：避免对页面内成千上万个普通布局节点无差别调用 getComputedStyle
+ */
+function passesFastInteractivePrecheck(el: HTMLElement): "definite" | "maybe_pointer" | "no" {
   const tag = el.tagName.toLowerCase();
-  if (["button", "select", "textarea", "summary"].includes(tag)) return true;
-  if (tag === "a" && (el.hasAttribute("href") || style.cursor === "pointer")) return true;
-  if (tag === "input" && (el as HTMLInputElement).type !== "hidden") return true;
-  if (el.isContentEditable) return true;
+  if (tag === "input") {
+    return (el as HTMLInputElement).type === "hidden" ? "no" : "definite";
+  }
+  if (INTERACTIVE_TAGS.has(tag)) {
+    if (tag === "a" && !el.hasAttribute("href")) return "maybe_pointer";
+    return "definite";
+  }
+  if (el.isContentEditable) return "definite";
 
   const role = el.getAttribute("role");
-  if (
-    role &&
-    [
-      "button",
-      "link",
-      "tab",
-      "menuitem",
-      "option",
-      "checkbox",
-      "radio",
-      "switch",
-      "combobox",
-      "textbox",
-      "searchbox"
-    ].includes(role)
-  ) {
-    return true;
+  if (role && INTERACTIVE_ROLES.has(role)) return "definite";
+
+  if (el.hasAttribute("onclick") || el.hasAttribute("@click") || el.hasAttribute("ng-click")) {
+    return "definite";
   }
 
-  if (el.hasAttribute("onclick") || (el.tabIndex >= 0 && style.cursor === "pointer")) {
-    return true;
+  if (el.tabIndex >= 0) return "maybe_pointer";
+
+  // 仅对子元素较少（常见自定义 div/span 按钮）的节点进一步检查 cursor: pointer
+  if (el.childElementCount <= 3 && (tag === "div" || tag === "span" || tag === "li" || tag === "label")) {
+    return "maybe_pointer";
   }
-  return false;
+  return "no";
 }
 
 function computeAccessibleName(el: HTMLElement): string {
@@ -617,10 +655,11 @@ function computeAccessibleName(el: HTMLElement): string {
   if (ariaLabel) return ariaLabel;
 
   const labelledBy = el.getAttribute("aria-labelledby");
+  const ownerDoc = el.ownerDocument || document;
   if (labelledBy) {
     const labelText = labelledBy
       .split(/\s+/)
-      .map((id) => document.getElementById(id)?.textContent?.trim() || "")
+      .map((id) => ownerDoc.getElementById(id)?.textContent?.trim() || "")
       .filter(Boolean)
       .join(" ");
     if (labelText) return labelText;
@@ -628,7 +667,7 @@ function computeAccessibleName(el: HTMLElement): string {
 
   if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
     if (el.id) {
-      const associatedLabel = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      const associatedLabel = ownerDoc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
       if (associatedLabel?.textContent?.trim()) {
         return associatedLabel.textContent.trim();
       }
@@ -668,6 +707,65 @@ function detectSensitiveSubmit(el: HTMLElement, role: string, name: string, text
   return false;
 }
 
+/**
+ * 检测在输入框内按 Enter 键是否会触发敏感表单提交
+ */
+function isEnterKeySensitiveOnElement(el: HTMLElement | null): { isSensitive: boolean; formName: string } {
+  if (!el) return { isSensitive: false, formName: "" };
+  const form = el.closest("form");
+  if (!form) {
+    const name = computeAccessibleName(el);
+    return {
+      isSensitive: SENSITIVE_SUBMIT_PATTERN.test(name),
+      formName: name || el.tagName.toLowerCase()
+    };
+  }
+  const submitBtn = form.querySelector(
+    'button[type="submit"], input[type="submit"], button:not([type="button"]):not([type="reset"])'
+  ) as HTMLElement | null;
+  if (submitBtn) {
+    const btnName = computeAccessibleName(submitBtn);
+    const btnText = (submitBtn.innerText || submitBtn.textContent || "").trim();
+    return {
+      isSensitive: true,
+      formName: btnName || btnText || form.getAttribute("name") || "form"
+    };
+  }
+  return { isSensitive: true, formName: form.getAttribute("name") || "form" };
+}
+
+function tableToMarkdown(table: HTMLTableElement): string {
+  const rows = Array.from(table.querySelectorAll("tr"));
+  if (rows.length === 0) return "";
+  const matrix: string[][] = [];
+  let maxCols = 0;
+
+  for (const tr of rows) {
+    const cells = Array.from(tr.querySelectorAll("th, td")).map((cell) =>
+      ((cell as HTMLElement).innerText || cell.textContent || "")
+        .replace(/\s+/g, " ")
+        .replace(/\|/g, "\\|")
+        .trim()
+    );
+    if (cells.some(Boolean)) {
+      matrix.push(cells);
+      if (cells.length > maxCols) maxCols = cells.length;
+    }
+  }
+
+  if (matrix.length === 0 || maxCols === 0) return "";
+  const normalizeRow = (r: string[]) => {
+    const padded = [...r];
+    while (padded.length < maxCols) padded.push("");
+    return `| ${padded.join(" | ")} |`;
+  };
+
+  const header = normalizeRow(matrix[0]);
+  const separator = `| ${Array(maxCols).fill("---").join(" | ")} |`;
+  const body = matrix.slice(1).map(normalizeRow);
+  return [header, separator, ...body].join("\n");
+}
+
 export function extractMarkdownDocument(maxChars = 16000): {
   title: string;
   url: string;
@@ -676,22 +774,35 @@ export function extractMarkdownDocument(maxChars = 16000): {
 } {
   const selection = window.getSelection()?.toString()?.trim() || "";
   const lines: string[] = [];
+  let totalLen = 0;
 
   const root = document.querySelector("main, article, [role='main']") || document.body;
   if (!root) {
     return { title: document.title, url: location.href, selection, markdown: "" };
   }
 
+  const consumedContainers = new WeakSet<Node>();
+
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
     acceptNode(node) {
       const el = node as HTMLElement;
-      if (el.id === STAGE_HOST_ID) return NodeFilter.FILTER_REJECT;
+      if (isStageNode(el)) return NodeFilter.FILTER_REJECT;
+      let parent = el.parentElement;
+      while (parent && parent !== root) {
+        if (consumedContainers.has(parent)) return NodeFilter.FILTER_REJECT;
+        parent = parent.parentElement;
+      }
       const tag = el.tagName?.toLowerCase();
       if (["script", "style", "noscript", "svg", "path", "nav", "footer"].includes(tag)) {
         return NodeFilter.FILTER_REJECT;
       }
       const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden") {
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        parseFloat(style.opacity || "1") < 0.05 ||
+        parseFloat(style.fontSize || "12") === 0
+      ) {
         return NodeFilter.FILTER_REJECT;
       }
       return NodeFilter.FILTER_ACCEPT;
@@ -702,17 +813,39 @@ export function extractMarkdownDocument(maxChars = 16000): {
   while (currentNode) {
     const el = currentNode as HTMLElement;
     const tag = el.tagName?.toLowerCase();
+    let chunk = "";
+
     if (/^h[1-6]$/.test(tag)) {
       const level = parseInt(tag[1], 10);
       const text = (el.innerText || "").replace(/\s+/g, " ").trim();
-      if (text) lines.push(`${"#".repeat(level)} ${text}`);
-    } else if (tag === "p" || tag === "li" || tag === "blockquote" || tag === "pre") {
+      if (text) chunk = `${"#".repeat(level)} ${text}`;
+      consumedContainers.add(el);
+    } else if (tag === "table" && el instanceof HTMLTableElement) {
+      chunk = tableToMarkdown(el);
+      consumedContainers.add(el);
+    } else if (tag === "pre") {
+      const codeText = (el.innerText || el.textContent || "").trim();
+      if (codeText) chunk = `\`\`\`\n${codeText}\n\`\`\``;
+      consumedContainers.add(el);
+    } else if (tag === "li") {
       const text = (el.innerText || "").replace(/\s+/g, " ").trim();
-      if (text && text.length > 1) {
-        lines.push(tag === "li" ? `- ${text}` : text);
-      }
+      if (text && text.length > 1) chunk = `- ${text}`;
+      consumedContainers.add(el);
+    } else if (tag === "blockquote") {
+      const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+      if (text) chunk = `> ${text}`;
+      consumedContainers.add(el);
+    } else if (tag === "p") {
+      const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+      if (text && text.length > 1) chunk = text;
+      consumedContainers.add(el);
     }
-    if (lines.join("\n").length >= maxChars) break;
+
+    if (chunk) {
+      lines.push(chunk);
+      totalLen += chunk.length + 2;
+      if (totalLen >= maxChars) break;
+    }
     currentNode = walker.nextNode();
   }
 
@@ -790,44 +923,67 @@ export function collectInteractiveSnapshot(options?: {
   const viewportOnly = options?.viewportOnly ?? false;
   const maxElements = options?.maxElements ?? 250;
 
-  ensureAgentStage();
-  setStageActionLabel("扫描页面元素", `AgentBridge 正在感知页面结构 (${document.title || location.hostname})`);
+  // 若未开启 highlight，保持静默，不主动创建视觉舞台 DOM
+  setStageActionLabel("扫描页面元素", `AgentBridge 正在感知页面结构 (${document.title || location.hostname})`, highlight);
 
   snapshotElementMap.clear();
   snapshotMetaMap.clear();
-  document
-    .querySelectorAll(`[${REF_ATTR}], [${REF_ATTR_ALIAS}]`)
-    .forEach((el) => {
-      el.removeAttribute(REF_ATTR);
-      el.removeAttribute(REF_ATTR_ALIAS);
-    });
+  snapshotOffsetMap.clear();
 
   const elements: InteractiveElementNode[] = [];
   let counter = 0;
 
-  const visitRoot = (root: Document | ShadowRoot | Element) => {
+  const visitRoot = (root: Document | ShadowRoot | Element, offsetX = 0, offsetY = 0) => {
     const allNodes = root.querySelectorAll("*");
     for (let i = 0; i < allNodes.length; i++) {
       if (elements.length >= maxElements) break;
       const el = allNodes[i] as HTMLElement;
-      if (el.id === STAGE_HOST_ID || el.closest(`#${STAGE_HOST_ID}`)) continue;
+      if (isStageNode(el)) continue;
 
-      if (el.shadowRoot && el.id !== STAGE_HOST_ID) {
-        visitRoot(el.shadowRoot);
+      if (el.shadowRoot) {
+        visitRoot(el.shadowRoot, offsetX, offsetY);
       }
 
-      const style = window.getComputedStyle(el);
-      if (!isInteractiveElement(el, style)) continue;
+      // 穿透同源 iframe 并叠加视口坐标偏移
+      if (el.tagName === "IFRAME") {
+        try {
+          const iframeEl = el as HTMLIFrameElement;
+          const iframeDoc = iframeEl.contentDocument;
+          if (iframeDoc) {
+            const iframeRect = iframeEl.getBoundingClientRect();
+            if (iframeRect.width >= 10 && iframeRect.height >= 10) {
+              visitRoot(iframeDoc, offsetX + iframeRect.left, offsetY + iframeRect.top);
+            }
+          }
+        } catch {
+          // 跨域 iframe 由浏览器同源策略隔离，安全忽略
+        }
+        continue;
+      }
 
-      const rect = el.getBoundingClientRect();
-      if (!isElementVisible(el, style, rect)) continue;
+      const precheck = passesFastInteractivePrecheck(el);
+      if (precheck === "no") continue;
+
+      const view = el.ownerDocument?.defaultView || window;
+      const style = view.getComputedStyle(el);
+      if (precheck === "maybe_pointer" && style.cursor !== "pointer") {
+        continue;
+      }
+
+      const rawRect = el.getBoundingClientRect();
+      if (!isElementVisible(el, style, rawRect)) continue;
+
+      const absLeft = rawRect.left + offsetX;
+      const absTop = rawRect.top + offsetY;
+      const absRight = rawRect.right + offsetX;
+      const absBottom = rawRect.bottom + offsetY;
 
       if (viewportOnly) {
         if (
-          rect.bottom < 0 ||
-          rect.top > window.innerHeight ||
-          rect.right < 0 ||
-          rect.left > window.innerWidth
+          absBottom < 0 ||
+          absTop > window.innerHeight ||
+          absRight < 0 ||
+          absLeft > window.innerWidth
         ) {
           continue;
         }
@@ -835,10 +991,8 @@ export function collectInteractiveSnapshot(options?: {
 
       counter += 1;
       const ref = `e${counter}`;
-      // 无论 highlight 是 true 还是 false，始终写入双属性并注册到内存 Map
-      el.setAttribute(REF_ATTR, ref);
-      el.setAttribute(REF_ATTR_ALIAS, ref);
       snapshotElementMap.set(ref, el);
+      snapshotOffsetMap.set(ref, { x: offsetX, y: offsetY });
 
       const role = inferRole(el);
       const name = computeAccessibleName(el);
@@ -854,28 +1008,30 @@ export function collectInteractiveSnapshot(options?: {
         disabled: (el as HTMLButtonElement).disabled === true || el.getAttribute("aria-disabled") === "true",
         isSensitiveSubmit: detectSensitiveSubmit(el, role, name, text),
         rect: {
-          x: Math.round(rect.left),
-          y: Math.round(rect.top),
-          width: Math.round(rect.width),
-          height: Math.round(rect.height)
+          x: Math.round(absLeft),
+          y: Math.round(absTop),
+          width: Math.round(rawRect.width),
+          height: Math.round(rawRect.height)
         }
       };
 
-      if (el instanceof HTMLInputElement) {
-        node.type = el.type;
-        if (el.type === "checkbox" || el.type === "radio") {
-          node.checked = el.checked;
-        } else if (el.type !== "password") {
-          node.value = el.value.slice(0, 120);
+      if (el instanceof HTMLInputElement || tagName === "input") {
+        const inputEl = el as HTMLInputElement;
+        node.type = inputEl.type;
+        if (inputEl.type === "checkbox" || inputEl.type === "radio") {
+          node.checked = inputEl.checked;
+        } else if (inputEl.type !== "password") {
+          node.value = (inputEl.value || "").slice(0, 120);
         }
-        if (el.placeholder) node.placeholder = el.placeholder;
-      } else if (el instanceof HTMLTextAreaElement) {
-        node.value = el.value.slice(0, 120);
-        if (el.placeholder) node.placeholder = el.placeholder;
-      } else if (el instanceof HTMLSelectElement) {
-        node.value = el.value;
-      } else if (el instanceof HTMLAnchorElement && el.href) {
-        node.href = el.href;
+        if (inputEl.placeholder) node.placeholder = inputEl.placeholder;
+      } else if (el instanceof HTMLTextAreaElement || tagName === "textarea") {
+        const areaEl = el as HTMLTextAreaElement;
+        node.value = (areaEl.value || "").slice(0, 120);
+        if (areaEl.placeholder) node.placeholder = areaEl.placeholder;
+      } else if (el instanceof HTMLSelectElement || tagName === "select") {
+        node.value = (el as HTMLSelectElement).value;
+      } else if (tagName === "a" && (el as HTMLAnchorElement).href) {
+        node.href = (el as HTMLAnchorElement).href;
       }
 
       snapshotMetaMap.set(ref, node);
@@ -883,7 +1039,7 @@ export function collectInteractiveSnapshot(options?: {
     }
   };
 
-  visitRoot(document);
+  visitRoot(document, 0, 0);
 
   if (highlight) {
     renderSetOfMarkOverlay(elements);
@@ -909,38 +1065,57 @@ export function collectInteractiveSnapshot(options?: {
   };
 }
 
-function queryDeepSelector(selector: string, root: Document | ShadowRoot | Element = document): HTMLElement | null {
-  const direct = root.querySelector(selector) as HTMLElement | null;
-  if (direct) return direct;
+function queryDeepSelector(
+  selector: string,
+  root: Document | ShadowRoot | Element = document,
+  offsetX = 0,
+  offsetY = 0
+): { el: HTMLElement; offsetX: number; offsetY: number } | null {
+  try {
+    const direct = root.querySelector(selector) as HTMLElement | null;
+    if (direct && !isStageNode(direct)) {
+      return { el: direct, offsetX, offsetY };
+    }
+  } catch {
+    return null;
+  }
+
   const all = root.querySelectorAll("*");
   for (let i = 0; i < all.length; i++) {
     const el = all[i] as HTMLElement;
-    if (el.id === STAGE_HOST_ID) continue;
+    if (isStageNode(el)) continue;
     if (el.shadowRoot) {
-      const found = queryDeepSelector(selector, el.shadowRoot);
+      const found = queryDeepSelector(selector, el.shadowRoot, offsetX, offsetY);
       if (found) return found;
+    }
+    if (el.tagName === "IFRAME") {
+      try {
+        const iframeEl = el as HTMLIFrameElement;
+        if (iframeEl.contentDocument) {
+          const r = iframeEl.getBoundingClientRect();
+          const found = queryDeepSelector(selector, iframeEl.contentDocument, offsetX + r.left, offsetY + r.top);
+          if (found) return found;
+        }
+      } catch {}
     }
   }
   return null;
 }
 
-function findElementByRefOrSelector(ref?: string, selector?: string): HTMLElement {
+function resolveElementWithOffset(ref?: string, selector?: string): {
+  el: HTMLElement;
+  offsetX: number;
+  offsetY: number;
+} {
   if (ref) {
     // 1. 内存 Map O(1) 直连命中
     const cached = snapshotElementMap.get(ref);
     if (cached && cached.isConnected) {
-      return cached;
+      const off = snapshotOffsetMap.get(ref) || { x: 0, y: 0 };
+      return { el: cached, offsetX: off.x, offsetY: off.y };
     }
 
-    // 2. 穿透 ShadowRoot 检索 data-agent-ref / data-agent-bridge-ref 属性
-    const escaped = CSS.escape(ref);
-    const byAttr = queryDeepSelector(`[${REF_ATTR}="${escaped}"], [${REF_ATTR_ALIAS}="${escaped}"]`);
-    if (byAttr) {
-      snapshotElementMap.set(ref, byAttr);
-      return byAttr;
-    }
-
-    // 3. 若 SPA (React/Vue) 在 snapshot 后重渲染替换了 DOM 节点，使用快照元数据自愈匹配
+    // 2. 若 SPA (React/Vue) 在 snapshot 后重渲染替换了 DOM 节点，使用快照元数据自愈匹配
     const meta = snapshotMetaMap.get(ref);
     if (meta) {
       const candidates = Array.from(document.querySelectorAll(meta.tagName)) as HTMLElement[];
@@ -948,6 +1123,7 @@ function findElementByRefOrSelector(ref?: string, selector?: string): HTMLElemen
       let bestScore = -1;
 
       for (const cand of candidates) {
+        if (isStageNode(cand)) continue;
         const style = window.getComputedStyle(cand);
         const rect = cand.getBoundingClientRect();
         if (!isElementVisible(cand, style, rect)) continue;
@@ -969,10 +1145,9 @@ function findElementByRefOrSelector(ref?: string, selector?: string): HTMLElemen
       }
 
       if (bestMatch) {
-        bestMatch.setAttribute(REF_ATTR, ref);
-        bestMatch.setAttribute(REF_ATTR_ALIAS, ref);
         snapshotElementMap.set(ref, bestMatch);
-        return bestMatch;
+        snapshotOffsetMap.set(ref, { x: 0, y: 0 });
+        return { el: bestMatch, offsetX: 0, offsetY: 0 };
       }
     }
   }
@@ -984,8 +1159,12 @@ function findElementByRefOrSelector(ref?: string, selector?: string): HTMLElemen
   throw new Error(`Element not found for ${ref ? `ref="${ref}"` : `selector="${selector}"`}. Run dom.snapshot first.`);
 }
 
+function findElementByRefOrSelector(ref?: string, selector?: string): HTMLElement {
+  return resolveElementWithOffset(ref, selector).el;
+}
+
 /**
- * 准备并动画滑行虚拟鼠标至目标元素（后台 Tab 自动 0ms 瞬发，不等待动画或平滑滚动）
+ * 准备并动画滑行虚拟鼠标至目标元素（含拟人微抖动坐标 Jitter，后台 Tab 自动 0ms 瞬发）
  */
 async function prepareAndGlideToElement(params: {
   ref?: string;
@@ -993,25 +1172,30 @@ async function prepareAndGlideToElement(params: {
   actionType?: "click" | "hover" | "fill" | "select";
   skipClickRipple?: boolean;
 }) {
-  const el = findElementByRefOrSelector(params.ref, params.selector);
+  const { el, offsetX, offsetY } = resolveElementWithOffset(params.ref, params.selector);
   const hidden = isPageHidden();
 
   if (hidden) {
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
   } else {
     el.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
-    await new Promise((r) => setTimeout(r, 90));
+    await new Promise((r) => setTimeout(r, 75));
   }
 
-  const rect = el.getBoundingClientRect();
+  const rawRect = el.getBoundingClientRect();
+  const rect = {
+    x: rawRect.left + offsetX,
+    y: rawRect.top + offsetY,
+    width: rawRect.width,
+    height: rawRect.height
+  };
   const role = inferRole(el);
   const name = computeAccessibleName(el);
   const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 100);
   const displayName = (name || text || params.ref || params.selector || el.tagName.toLowerCase()).slice(0, 28);
   const isSensitiveSubmit = detectSensitiveSubmit(el, role, name, text);
 
-  const x = Math.round(rect.left + rect.width / 2);
-  const y = Math.round(rect.top + rect.height / 2);
+  const { x, y } = computeNaturalTargetPoint(rect);
 
   showTargetLockRing(rect);
   const actionVerb =
@@ -1039,7 +1223,7 @@ async function prepareAndGlideToElement(params: {
 }
 
 /**
- * 拟真滑行至输入框 + 点击波纹 + 填入内容
+ * 拟真滑行至输入框 + 点击波纹 + 填入内容（自动脱敏 password 字段，并派发完整按键与输入事件链）
  */
 async function fillElementValueAnimated(params: {
   ref?: string;
@@ -1055,22 +1239,58 @@ async function fillElementValueAnimated(params: {
   });
 
   el.focus();
-  const preview = params.value.length > 20 ? `${params.value.slice(0, 20)}...` : params.value;
-  setStageActionLabel(`输入 "${preview}"`, `AgentBridge 正在输入 "${preview}"`);
+  const isPassword = el.tagName.toLowerCase() === "input" && (el as HTMLInputElement).type === "password";
+  const maskedValue = isPassword
+    ? "••••••••"
+    : params.value.length > 20
+      ? `${params.value.slice(0, 20)}...`
+      : params.value;
+  setStageActionLabel(`输入 "${maskedValue}"`, `AgentBridge 正在输入 "${maskedValue}"`, true);
 
-  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+  const lastChar = params.value.slice(-1) || "a";
+  const keyOpts: KeyboardEventInit = {
+    key: lastChar,
+    code: `Key${lastChar.toUpperCase()}`,
+    bubbles: true,
+    cancelable: true,
+    composed: true
+  };
+
+  el.dispatchEvent(new KeyboardEvent("keydown", keyOpts));
+  el.dispatchEvent(
+    new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      data: params.value,
+      inputType: "insertText"
+    })
+  );
+
+  const tagName = el.tagName.toLowerCase();
+  const enterCheck = isEnterKeySensitiveOnElement(el);
+
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || tagName === "input" || tagName === "textarea") {
+    const inputEl = el as HTMLInputElement | HTMLTextAreaElement;
+    const view = el.ownerDocument?.defaultView || window;
     const proto =
-      el instanceof HTMLInputElement ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+      tagName === "input" ? view.HTMLInputElement.prototype : view.HTMLTextAreaElement.prototype;
     const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-    const nextValue = params.clear === false ? `${el.value}${params.value}` : params.value;
+    const nextValue = params.clear === false ? `${inputEl.value}${params.value}` : params.value;
     if (nativeSetter) {
-      nativeSetter.call(el, nextValue);
+      nativeSetter.call(inputEl, nextValue);
     } else {
-      el.value = nextValue;
+      inputEl.value = nextValue;
     }
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: params.value, inputType: "insertText" }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { tagName: el.tagName.toLowerCase(), value: el.value };
+    inputEl.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: params.value, inputType: "insertText" }));
+    inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+    inputEl.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
+    return {
+      tagName,
+      value: isPassword ? "***" : inputEl.value,
+      isSensitiveEnter: enterCheck.isSensitive,
+      formName: enterCheck.formName
+    };
   }
 
   if (el.isContentEditable) {
@@ -1078,16 +1298,22 @@ async function fillElementValueAnimated(params: {
       el.innerHTML = "";
     }
     el.textContent = params.clear === false ? `${el.textContent || ""}${params.value}` : params.value;
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: params.value, inputType: "insertText" }));
-    return { tagName: el.tagName.toLowerCase(), value: el.textContent || "" };
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: params.value, inputType: "insertText" }));
+    el.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
+    return {
+      tagName,
+      value: el.textContent || "",
+      isSensitiveEnter: enterCheck.isSensitive,
+      formName: enterCheck.formName
+    };
   }
 
-  throw new Error(`Element <${el.tagName.toLowerCase()}> is not a fillable input or contenteditable`);
+  throw new Error(`Element <${tagName}> is not a fillable input or contenteditable`);
 }
 
 async function selectElementOptionAnimated(params: { ref?: string; selector?: string; value: string }) {
-  const el = findElementByRefOrSelector(params.ref, params.selector);
-  if (!(el instanceof HTMLSelectElement)) {
+  const el = findElementByRefOrSelector(params.ref, params.selector) as HTMLSelectElement;
+  if (el.tagName.toLowerCase() !== "select") {
     throw new Error(`Element <${el.tagName.toLowerCase()}> is not a <select> element`);
   }
   await prepareAndGlideToElement({
@@ -1108,35 +1334,58 @@ async function selectElementOptionAnimated(params: { ref?: string; selector?: st
   return { selectedValue: el.value, selectedText: option.text.trim() };
 }
 
-function fallbackSyntheticClick(params: { ref?: string; selector?: string }) {
-  const el = findElementByRefOrSelector(params.ref, params.selector);
-  const rect = el.getBoundingClientRect();
-  const clientX = Math.round(rect.left + rect.width / 2);
-  const clientY = Math.round(rect.top + rect.height / 2);
-  const eventInit: MouseEventInit = {
+/**
+ * 派发包含完整物理屏幕坐标 (screenX/screenY) 与自然按压延时的点击序列
+ */
+async function performNaturalSyntheticClick(params: { ref?: string; selector?: string; x?: number; y?: number }) {
+  const { el, offsetX, offsetY } = resolveElementWithOffset(params.ref, params.selector);
+  const rawRect = el.getBoundingClientRect();
+  const jittered = computeNaturalTargetPoint({
+    x: rawRect.left,
+    y: rawRect.top,
+    width: rawRect.width,
+    height: rawRect.height
+  });
+  const clientX = params.x !== undefined ? params.x - offsetX : jittered.x;
+  const clientY = params.y !== undefined ? params.y - offsetY : jittered.y;
+  const screenX = Math.round(clientX + offsetX + (window.screenX || 0));
+  const screenY = Math.round(clientY + offsetY + (window.screenY || 0) + (window.outerHeight - window.innerHeight));
+
+  const view = el.ownerDocument?.defaultView || window;
+  const baseInit: MouseEventInit = {
     bubbles: true,
     cancelable: true,
     composed: true,
-    view: window,
+    view,
     clientX,
     clientY,
+    screenX,
+    screenY,
     button: 0,
-    buttons: 1
+    buttons: 1,
+    detail: 1
   };
 
-  el.dispatchEvent(new PointerEvent("pointerover", eventInit));
-  el.dispatchEvent(new MouseEvent("mouseover", eventInit));
-  el.dispatchEvent(new PointerEvent("pointerenter", { ...eventInit, bubbles: false }));
-  el.dispatchEvent(new MouseEvent("mouseenter", { ...eventInit, bubbles: false }));
-  el.dispatchEvent(new PointerEvent("pointermove", eventInit));
-  el.dispatchEvent(new MouseEvent("mousemove", eventInit));
-  el.dispatchEvent(new PointerEvent("pointerdown", eventInit));
-  el.dispatchEvent(new MouseEvent("mousedown", eventInit));
+  el.dispatchEvent(new PointerEvent("pointerover", baseInit));
+  el.dispatchEvent(new MouseEvent("mouseover", baseInit));
+  el.dispatchEvent(new PointerEvent("pointerenter", { ...baseInit, bubbles: false }));
+  el.dispatchEvent(new MouseEvent("mouseenter", { ...baseInit, bubbles: false }));
+  el.dispatchEvent(new PointerEvent("pointermove", baseInit));
+  el.dispatchEvent(new MouseEvent("mousemove", baseInit));
+  el.dispatchEvent(new PointerEvent("pointerdown", baseInit));
+  el.dispatchEvent(new MouseEvent("mousedown", baseInit));
   el.focus();
-  el.dispatchEvent(new PointerEvent("pointerup", eventInit));
-  el.dispatchEvent(new MouseEvent("mouseup", eventInit));
+
+  if (!isPageHidden()) {
+    const pressDelay = 28 + Math.floor(Math.random() * 34);
+    await new Promise((r) => setTimeout(r, pressDelay));
+  }
+
+  const releaseInit: MouseEventInit = { ...baseInit, buttons: 0 };
+  el.dispatchEvent(new PointerEvent("pointerup", releaseInit));
+  el.dispatchEvent(new MouseEvent("mouseup", releaseInit));
   el.click();
-  return { clicked: true, clientX, clientY };
+  return { clicked: true, clientX: clientX + offsetX, clientY: clientY + offsetY, screenX, screenY };
 }
 
 function dispatchDomKeyPress(params: { key: string }) {
@@ -1158,21 +1407,177 @@ function dispatchDomKeyPress(params: { key: string }) {
   return { key, targetTag: target.tagName.toLowerCase() };
 }
 
-const globalWindow = window as unknown as {
-  __AGENT_BRIDGE_LISTENER__?: (
-    message: any,
-    sender: chrome.runtime.MessageSender,
-    sendResponse: (response?: any) => void
-  ) => boolean;
-};
+/**
+ * 查找页面内可滚动容器（支持显式指定 ref/selector，或从当前光标/视口中心自动探测局部 overflow 容器）
+ */
+function findScrollableContainer(
+  ref?: string,
+  selector?: string,
+  deltaX = 0,
+  deltaY = 500
+): HTMLElement | null {
+  if (ref || selector) {
+    return findElementByRefOrSelector(ref, selector);
+  }
 
-if (globalWindow.__AGENT_BRIDGE_LISTENER__) {
+  const isScrollable = (node: HTMLElement): boolean => {
+    const style = window.getComputedStyle(node);
+    if (Math.abs(deltaY) >= Math.abs(deltaX)) {
+      const canY = ["auto", "scroll", "overlay"].includes(style.overflowY);
+      return canY && node.scrollHeight > node.clientHeight + 4;
+    }
+    const canX = ["auto", "scroll", "overlay"].includes(style.overflowX);
+    return canX && node.scrollWidth > node.clientWidth + 4;
+  };
+
+  // 1. 从当前虚拟鼠标位置或视口中心下的元素向上查找可滚动祖先
+  const probeX = stageState?.cursorVisible ? stageState.cursorX : Math.round(window.innerWidth / 2);
+  const probeY = stageState?.cursorVisible ? stageState.cursorY : Math.round(window.innerHeight / 2);
+  let curr = document.elementFromPoint(probeX, probeY) as HTMLElement | null;
+  while (curr && curr !== document.body && curr !== document.documentElement) {
+    if (!isStageNode(curr) && isScrollable(curr)) {
+      return curr;
+    }
+    curr = curr.parentElement;
+  }
+
+  // 2. 若文档根节点自身不可滚动（如飞书、Notion 等全屏应用），查找页面内面积最大的可滚动容器
+  const docScrollable = document.documentElement.scrollHeight > window.innerHeight + 8;
+  if (!docScrollable) {
+    const candidates = Array.from(document.querySelectorAll("main, section, div, ul, article")) as HTMLElement[];
+    let best: HTMLElement | null = null;
+    let bestArea = 0;
+    for (const c of candidates) {
+      if (isStageNode(c)) continue;
+      if (isScrollable(c)) {
+        const r = c.getBoundingClientRect();
+        const area = r.width * r.height;
+        if (area > bestArea && r.width > 120 && r.height > 120) {
+          bestArea = area;
+          best = c;
+        }
+      }
+    }
+    if (best) return best;
+  }
+
+  return null;
+}
+
+/**
+ * 智能等待条件满足（支持 selector 出现/消失、文本包含、或 DOM 变更静默）
+ */
+async function waitForPageCondition(params: {
+  selector?: string;
+  text?: string;
+  state?: "visible" | "hidden" | "attached" | "detached" | "domSettled";
+  timeoutMs?: number;
+  settleMs?: number;
+}): Promise<{ matched: boolean; elapsedMs: number; url: string; title: string }> {
+  const timeoutMs = Math.min(20000, Math.max(100, Number(params.timeoutMs ?? 5000)));
+  const state = params.state || (params.selector || params.text ? "visible" : "domSettled");
+  const startTime = performance.now();
+
+  if (state === "domSettled") {
+    const quietWindowMs = Math.min(1000, Math.max(80, Number(params.settleMs ?? 180)));
+    return new Promise((resolve) => {
+      let quietTimer: ReturnType<typeof setTimeout>;
+      const done = (matched: boolean) => {
+        clearTimeout(quietTimer);
+        clearTimeout(maxTimer);
+        observer.disconnect();
+        resolve({
+          matched,
+          elapsedMs: Math.round(performance.now() - startTime),
+          url: location.href,
+          title: document.title
+        });
+      };
+
+      const observer = new MutationObserver(() => {
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => done(true), quietWindowMs);
+      });
+
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true
+      });
+
+      quietTimer = setTimeout(() => done(true), quietWindowMs);
+      const maxTimer = setTimeout(() => done(true), timeoutMs);
+    });
+  }
+
+  const checkNow = (): boolean => {
+    if (params.selector) {
+      const found = queryDeepSelector(params.selector);
+      if (state === "detached") return !found;
+      if (state === "attached") return Boolean(found);
+      if (!found) return state === "hidden";
+      const style = window.getComputedStyle(found.el);
+      const rect = found.el.getBoundingClientRect();
+      const vis = isElementVisible(found.el, style, rect);
+      return state === "hidden" ? !vis : vis;
+    }
+    if (params.text) {
+      const bodyText = document.body?.innerText || document.documentElement?.textContent || "";
+      const hasText = bodyText.includes(params.text);
+      return state === "hidden" || state === "detached" ? !hasText : hasText;
+    }
+    return true;
+  };
+
+  if (checkNow()) {
+    return {
+      matched: true,
+      elapsedMs: Math.round(performance.now() - startTime),
+      url: location.href,
+      title: document.title
+    };
+  }
+
+  return new Promise((resolve) => {
+    const interval = setInterval(() => {
+      if (checkNow()) {
+        clearInterval(interval);
+        clearTimeout(timer);
+        resolve({
+          matched: true,
+          elapsedMs: Math.round(performance.now() - startTime),
+          url: location.href,
+          title: document.title
+        });
+      }
+    }, 60);
+
+    const timer = setTimeout(() => {
+      clearInterval(interval);
+      resolve({
+        matched: checkNow(),
+        elapsedMs: Math.round(performance.now() - startTime),
+        url: location.href,
+        title: document.title
+      });
+    }, timeoutMs);
+  });
+}
+
+// 使用模块级闭包维护 Listener，避免在 window 对象上挂载任何可读字符串属性
+let activeMessageListener: ((
+  message: any,
+  sender: chrome.runtime.MessageSender,
+  sendResponse: (response?: any) => void
+) => boolean) | null = null;
+
+if (activeMessageListener) {
   try {
-    chrome.runtime.onMessage.removeListener(globalWindow.__AGENT_BRIDGE_LISTENER__);
+    chrome.runtime.onMessage.removeListener(activeMessageListener);
   } catch {}
 }
 
-const messageListener = (
+activeMessageListener = (
   message: any,
   _sender: chrome.runtime.MessageSender,
   sendResponse: (response?: any) => void
@@ -1230,7 +1635,8 @@ const messageListener = (
         }
 
         case "ab:readDocument":
-          setStageActionLabel("读取页面上下文", "AgentBridge 正在读取当前页面内容");
+          // 只读模式下不强制创建舞台 DOM
+          setStageActionLabel("读取页面上下文", "AgentBridge 正在读取当前页面内容", false);
           sendResponse({ ok: true, result: extractMarkdownDocument(message.payload?.maxChars) });
           return;
 
@@ -1257,9 +1663,17 @@ const messageListener = (
           return;
         }
 
-        case "ab:syntheticClick":
-          sendResponse({ ok: true, result: fallbackSyntheticClick(message.payload) });
+        case "ab:syntheticClick": {
+          const clickRes = await performNaturalSyntheticClick(message.payload || {});
+          sendResponse({ ok: true, result: clickRes });
           return;
+        }
+
+        case "ab:checkEnterSensitivity": {
+          const active = (document.activeElement as HTMLElement) || null;
+          sendResponse({ ok: true, result: isEnterKeySensitiveOnElement(active) });
+          return;
+        }
 
         case "ab:pressKey":
           sendResponse({ ok: true, result: dispatchDomKeyPress(message.payload) });
@@ -1280,20 +1694,66 @@ const messageListener = (
         case "ab:scroll": {
           const dx = Number(message.payload?.deltaX ?? 0);
           const dy = Number(message.payload?.deltaY ?? 500);
-          setStageActionLabel(dy >= 0 ? "向下滚动" : "向上滚动", "AgentBridge 正在滚动浏览页面");
-          if (isPageHidden()) {
-            window.scrollBy({ left: dx, top: dy, behavior: "instant" as ScrollBehavior });
+          const container = findScrollableContainer(
+            message.payload?.ref,
+            message.payload?.selector,
+            dx,
+            dy
+          );
+          setStageActionLabel(dy >= 0 ? "向下滚动" : "向上滚动", "AgentBridge 正在滚动浏览页面", false);
+          const behavior: ScrollBehavior = isPageHidden() ? ("instant" as ScrollBehavior) : "smooth";
+
+          if (container) {
+            container.scrollBy({ left: dx, top: dy, behavior });
+            if (!isPageHidden()) await new Promise((r) => setTimeout(r, 140));
+            sendResponse({
+              ok: true,
+              result: {
+                scrolledContainer: container.tagName.toLowerCase(),
+                scrollX: Math.round(container.scrollLeft),
+                scrollY: Math.round(container.scrollTop)
+              }
+            });
           } else {
-            window.scrollBy({ left: dx, top: dy, behavior: "smooth" });
-            await new Promise((r) => setTimeout(r, 180));
+            window.scrollBy({ left: dx, top: dy, behavior });
+            if (!isPageHidden()) await new Promise((r) => setTimeout(r, 140));
+            sendResponse({
+              ok: true,
+              result: {
+                scrolledContainer: "window",
+                scrollX: Math.round(window.scrollX),
+                scrollY: Math.round(window.scrollY)
+              }
+            });
           }
-          sendResponse({
-            ok: true,
-            result: {
-              scrollX: Math.round(window.scrollX),
-              scrollY: Math.round(window.scrollY)
-            }
-          });
+          return;
+        }
+
+        case "ab:waitFor": {
+          const waitRes = await waitForPageCondition(message.payload || {});
+          sendResponse({ ok: true, result: waitRes });
+          return;
+        }
+
+        case "ab:prepareFileUpload": {
+          const el = findElementByRefOrSelector(message.payload?.ref, message.payload?.selector);
+          if (el.tagName.toLowerCase() !== "input" || (el as HTMLInputElement).type !== "file") {
+            throw new Error(`Target element <${el.tagName.toLowerCase()}> is not an <input type="file">`);
+          }
+          // 临时生成一个瞬时唯一属性供 CDP DOM.querySelector 定位，定位后立即清除
+          const token = `ab-up-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+          el.setAttribute("data-ab-upload-target", token);
+          sendResponse({ ok: true, result: { selector: `[data-ab-upload-target="${token}"]`, token } });
+          return;
+        }
+
+        case "ab:cleanupFileUpload": {
+          const token = message.payload?.token;
+          if (token) {
+            const el = document.querySelector(`[data-ab-upload-target="${CSS.escape(token)}"]`);
+            if (el) el.removeAttribute("data-ab-upload-target");
+          }
+          sendResponse({ ok: true, result: { cleaned: true } });
           return;
         }
 
@@ -1312,5 +1772,4 @@ const messageListener = (
   return true;
 };
 
-globalWindow.__AGENT_BRIDGE_LISTENER__ = messageListener;
-chrome.runtime.onMessage.addListener(messageListener);
+chrome.runtime.onMessage.addListener(activeMessageListener);

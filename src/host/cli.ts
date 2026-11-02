@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DEFAULT_EXTENSION_ID } from "../shared/extension-identity.js";
+import type { PageSnapshotResult } from "../shared/protocol.js";
 import { BridgeClient, getDefaultSocketPath } from "./bridge-hub.js";
 import { installNativeMessagingHost } from "./installer.js";
-import { runMcpServer } from "./mcp-server.js";
+import { formatCompactSnapshot, runMcpServer } from "./mcp-server.js";
 import { runNativeHostProcess } from "./native-host-entry.js";
 
 function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
@@ -39,18 +40,27 @@ Usage:
   agent-bridge native-host                     Internal entry invoked by Chrome connectNative
   agent-bridge status                          Check bridge & extension connection status
   agent-bridge reload                          Hot-reload the Chrome extension
+  agent-bridge stealth <on|off>                Toggle Stealth anti-detection mode
   agent-bridge dev <on|off>                    Toggle Developer Mode (Full CDP access)
   agent-bridge tabs                            List all open browser tabs
-  agent-bridge open <url> [--background]       Open URL in dedicated 'AI Agent' Tab Group with AI cursor stage
+  agent-bridge open <url> [--foreground]       Open URL silently in 'AI Agent' Tab Group (use --foreground to focus)
   agent-bridge read [tabId...]                 Read clean Markdown context from one or more tabs
-  agent-bridge snapshot [--tab <id>] [--highlight]
+  agent-bridge snapshot [--tab <id>] [--highlight] [--compact]
                                                Distill interactive DOM/AX elements (e1, e2...)
   agent-bridge move <refOrSelectorOrX> [y] [--tab <id>]
                                                Smoothly glide the AI virtual mouse cursor to target/coords
   agent-bridge click <refOrSelector> [--tab <id>] [--confirm]
                                                Glide AI cursor + ripple + click on element ref
-  agent-bridge fill <refOrSelector> <text> [--tab <id>] [--enter]
+  agent-bridge fill <refOrSelector> <text> [--tab <id>] [--enter] [--confirm]
                                                Fill input/textarea/contenteditable element
+  agent-bridge scroll [deltaY] [--ref <eId>] [--tab <id>]
+                                               Scroll page or scrollable container
+  agent-bridge wait [selectorOrText] [--timeout <ms>] [--tab <id>]
+                                               Wait for selector/text or DOM settled
+  agent-bridge upload <refOrSelector> <filePath...> [--tab <id>]
+                                               Upload local file(s) to <input type="file">
+  agent-bridge batch '<jsonSteps>' [--tab <id>]
+                                               Execute multiple actions in a single round-trip
   agent-bridge press <key> [--tab <id>]        Dispatch key press (e.g. Enter, Escape)
   agent-bridge screenshot [out.png] [--tab <id>] [--full-page]
                                                Capture tab screenshot
@@ -69,7 +79,6 @@ async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
   const subcommand = rawArgs[0];
 
-  // 当 Chrome 通过 Native Messaging 启动本脚本时，第一个参数通常是 chrome-extension://...
   if (
     subcommand === "native-host" ||
     (subcommand && subcommand.startsWith("chrome-extension://"))
@@ -94,14 +103,20 @@ async function main(): Promise<void> {
     const extraId = typeof flags["extension-id"] === "string" ? [flags["extension-id"]] : [];
     const res = installNativeMessagingHost({ extensionIds: extraId });
     const extDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../extension");
-    console.log(JSON.stringify({
-      ok: true,
-      hostName: res.hostName,
-      wrapperPath: res.wrapperPath,
-      extensionIds: res.extensionIds,
-      unpackedExtensionDirectory: extDir,
-      installedManifestPaths: res.installedManifestPaths
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          hostName: res.hostName,
+          wrapperPath: res.wrapperPath,
+          extensionIds: res.extensionIds,
+          unpackedExtensionDirectory: extDir,
+          installedManifestPaths: res.installedManifestPaths
+        },
+        null,
+        2
+      )
+    );
     return;
   }
 
@@ -118,6 +133,15 @@ async function main(): Promise<void> {
       response = await client.call("bridge.reload");
       break;
 
+    case "stealth": {
+      const mode = positional[0];
+      const enableStealth = mode === "on" || mode === "true" || mode === "1";
+      response = await client.call("guard.updateConfig", {
+        stealthMode: enableStealth
+      });
+      break;
+    }
+
     case "dev": {
       const mode = positional[0];
       const enableDev = mode === "on" || mode === "true" || mode === "1";
@@ -133,10 +157,10 @@ async function main(): Promise<void> {
 
     case "open": {
       const url = positional[0];
-      if (!url) throw new Error("Usage: agent-bridge open <url> [--background]");
+      if (!url) throw new Error("Usage: agent-bridge open <url> [--foreground]");
       response = await client.call("tabs.open", {
         url,
-        active: flags.background ? false : true
+        active: Boolean(flags.foreground || flags.active)
       });
       break;
     }
@@ -153,6 +177,10 @@ async function main(): Promise<void> {
         highlight: Boolean(flags.highlight ?? false),
         viewportOnly: Boolean(flags.viewport ?? false)
       });
+      if (response.ok && flags.compact && response.result) {
+        console.log(formatCompactSnapshot(response.result as PageSnapshotResult));
+        return;
+      }
       break;
 
     case "move": {
@@ -192,21 +220,79 @@ async function main(): Promise<void> {
       const target = positional[0];
       const value = positional[1];
       if (!target || value === undefined) {
-        throw new Error("Usage: agent-bridge fill <refOrSelector> <value> [--tab <id>] [--enter]");
+        throw new Error("Usage: agent-bridge fill <refOrSelector> <value> [--tab <id>] [--enter] [--confirm]");
       }
       const isRef = /^e\d+$/.test(target);
       response = await client.call("dom.fill", {
         tabId,
         ...(isRef ? { ref: target } : { selector: target }),
         value,
-        pressEnter: Boolean(flags.enter ?? false)
+        pressEnter: Boolean(flags.enter ?? false),
+        confirmed: Boolean(flags.confirm ?? false)
+      });
+      break;
+    }
+
+    case "scroll": {
+      const dy = positional[0] !== undefined ? Number(positional[0]) : 500;
+      const refFlag = typeof flags.ref === "string" ? flags.ref : undefined;
+      const selFlag = typeof flags.selector === "string" ? flags.selector : undefined;
+      response = await client.call("dom.scroll", {
+        tabId,
+        deltaY: dy,
+        ref: refFlag,
+        selector: selFlag
+      });
+      break;
+    }
+
+    case "wait": {
+      const target = positional[0];
+      const timeoutMs = flags.timeout !== undefined ? Number(flags.timeout) : 5000;
+      const isSelector = target && (target.startsWith("#") || target.startsWith(".") || target.startsWith("["));
+      response = await client.call("dom.waitFor", {
+        tabId,
+        ...(isSelector ? { selector: target } : target ? { text: target } : { state: "domSettled" }),
+        timeoutMs
+      });
+      break;
+    }
+
+    case "upload": {
+      const target = positional[0];
+      const files = positional.slice(1).map((f) => path.resolve(f));
+      if (!target || files.length === 0) {
+        throw new Error("Usage: agent-bridge upload <refOrSelector> <filePath...> [--tab <id>]");
+      }
+      const isRef = /^e\d+$/.test(target);
+      response = await client.call("dom.uploadFile", {
+        tabId,
+        ...(isRef ? { ref: target } : { selector: target }),
+        files
+      });
+      break;
+    }
+
+    case "batch": {
+      const rawSteps = positional[0];
+      if (!rawSteps) {
+        throw new Error("Usage: agent-bridge batch '<jsonStepsArray>' [--tab <id>]");
+      }
+      const steps = JSON.parse(rawSteps);
+      response = await client.call("dom.batch", {
+        tabId,
+        steps
       });
       break;
     }
 
     case "press": {
       const key = positional[0] || "Enter";
-      response = await client.call("dom.press", { tabId, key });
+      response = await client.call("dom.press", {
+        tabId,
+        key,
+        confirmed: Boolean(flags.confirm ?? false)
+      });
       break;
     }
 
@@ -218,7 +304,9 @@ async function main(): Promise<void> {
       });
       if (response.ok && response.result?.base64Data) {
         fs.writeFileSync(outPath, Buffer.from(response.result.base64Data, "base64"));
-        console.log(JSON.stringify({ ok: true, tabId: response.result.tabId, savedTo: path.resolve(outPath) }, null, 2));
+        console.log(
+          JSON.stringify({ ok: true, tabId: response.result.tabId, savedTo: path.resolve(outPath) }, null, 2)
+        );
         return;
       }
       break;

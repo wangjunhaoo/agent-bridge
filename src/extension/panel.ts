@@ -1,6 +1,7 @@
 import type { AuditLogItem, ExtensionGuardConfig } from "../shared/protocol.js";
 
 const toggleEnabled = document.getElementById("toggleEnabled") as HTMLInputElement;
+const toggleStealthMode = document.getElementById("toggleStealthMode") as HTMLInputElement;
 const toggleDevMode = document.getElementById("toggleDevMode") as HTMLInputElement;
 const toggleConfirmSubmit = document.getElementById("toggleConfirmSubmit") as HTMLInputElement;
 const masterStatusLabel = document.getElementById("masterStatusLabel") as HTMLElement;
@@ -11,6 +12,15 @@ const nativeErrorBox = document.getElementById("nativeErrorBox") as HTMLElement;
 const attachedCount = document.getElementById("attachedCount") as HTMLElement;
 const auditList = document.getElementById("auditList") as HTMLElement;
 const btnReconnect = document.getElementById("btnReconnect") as HTMLButtonElement;
+
+function escapeHtml(raw: string): string {
+  return String(raw ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function renderState(state: {
   extensionId?: string;
@@ -28,6 +38,9 @@ function renderState(state: {
 
   toggleEnabled.checked = state.guardConfig.enabled;
   masterStatusLabel.textContent = state.guardConfig.enabled ? "已开启" : "关闭";
+  if (toggleStealthMode) {
+    toggleStealthMode.checked = state.guardConfig.stealthMode !== false;
+  }
   toggleDevMode.checked = state.guardConfig.developerMode;
   toggleConfirmSubmit.checked = state.guardConfig.confirmBeforeSubmit;
 
@@ -55,13 +68,17 @@ function renderState(state: {
     .slice(0, 25)
     .map((item) => {
       const timeStr = new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour12: false });
+      const safeStatus = ["ok", "blocked", "error"].includes(item.status) ? item.status : "ok";
+      const safeMethod = escapeHtml(item.method);
+      const safeTab = item.tabId ? ` (#${Number(item.tabId)})` : "";
+      const safeSummary = escapeHtml(item.summary);
       return `
-        <div class="audit-item ${item.status}">
+        <div class="audit-item ${safeStatus}">
           <div class="audit-item-top">
-            <span>${item.method}${item.tabId ? ` (#${item.tabId})` : ""}</span>
-            <span>${timeStr}</span>
+            <span>${safeMethod}${safeTab}</span>
+            <span>${escapeHtml(timeStr)}</span>
           </div>
-          <div>${item.summary}</div>
+          <div>${safeSummary}</div>
         </div>
       `;
     })
@@ -94,6 +111,10 @@ function refreshState(): void {
 
 toggleEnabled.addEventListener("change", () => {
   updateConfig({ enabled: toggleEnabled.checked });
+});
+
+toggleStealthMode?.addEventListener("change", () => {
+  updateConfig({ stealthMode: toggleStealthMode.checked });
 });
 
 toggleDevMode.addEventListener("change", () => {
